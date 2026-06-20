@@ -1,0 +1,1186 @@
+[
+ {
+  "store_number": 201,
+  "city": "Ajax",
+  "address": "105 Bayly Street West",
+  "cross_streets": "Bayly & Harwood",
+  "centroid_lat": 43.8505,
+  "centroid_lng": -79.0209
+ },
+ {
+  "store_number": 191,
+  "city": "Ajax",
+  "address": "1979 Salem Road North",
+  "cross_streets": "Salem & Taunton",
+  "centroid_lat": 43.8505,
+  "centroid_lng": -79.0209
+ },
+ {
+  "store_number": 311,
+  "city": "Aurora",
+  "address": "1 Henderson Drive",
+  "cross_streets": "Yonge & Henderson",
+  "centroid_lat": 43.9997,
+  "centroid_lng": -79.4675
+ },
+ {
+  "store_number": 630,
+  "city": "Aurora",
+  "address": "15830 Bayview Avenue",
+  "cross_streets": "Bayview & St. John",
+  "centroid_lat": 43.9997,
+  "centroid_lng": -79.4675
+ },
+ {
+  "store_number": 187,
+  "city": "Barrie",
+  "address": "",
+  "cross_streets": "Bayfield & Hanmer",
+  "centroid_lat": 44.3893,
+  "centroid_lng": -79.6901
+ },
+ {
+  "store_number": 684,
+  "city": "Barrie",
+  "address": "",
+  "cross_streets": "Cundles & Hwy 400",
+  "centroid_lat": 44.3893,
+  "centroid_lng": -79.6901
+ },
+ {
+  "store_number": 288,
+  "city": "Barrie",
+  "address": "",
+  "cross_streets": "Mapleview & Bryne",
+  "centroid_lat": 44.3893,
+  "centroid_lng": -79.6901
+ },
+ {
+  "store_number": 601,
+  "city": "Brampton",
+  "address": "100 Clementine Drive",
+  "cross_streets": "Mavis & Steeles",
+  "centroid_lat": 43.6858,
+  "centroid_lng": -79.7599
+ },
+ {
+  "store_number": 661,
+  "city": "Brampton",
+  "address": "11785 Bramalea Road",
+  "cross_streets": "Bramalea & Mayfield",
+  "centroid_lat": 43.6858,
+  "centroid_lng": -79.7599
+ },
+ {
+  "store_number": 171,
+  "city": "Brampton",
+  "address": "170 Sandalwood Parkway East",
+  "cross_streets": "Sandalwood & Kennedy",
+  "centroid_lat": 43.6858,
+  "centroid_lng": -79.7599
+ },
+ {
+  "store_number": 647,
+  "city": "Brampton",
+  "address": "180 Great Lakes Drive",
+  "cross_streets": "Bovaird & Great Lakes",
+  "centroid_lat": 43.6858,
+  "centroid_lng": -79.7599
+ },
+ {
+  "store_number": 183,
+  "city": "Brampton",
+  "address": "27 George Street North",
+  "cross_streets": "Main & Queen",
+  "centroid_lat": 43.6858,
+  "centroid_lng": -79.7599
+ },
+ {
+  "store_number": 470,
+  "city": "Brampton",
+  "address": "31 Worthington Avenue",
+  "cross_streets": "Worthington & Bovaird",
+  "centroid_lat": 43.6858,
+  "centroid_lng": -79.7599
+ },
+ {
+  "store_number": 773,
+  "city": "Brampton",
+  "address": "40 Coventry Road",
+  "cross_streets": "Queen St E & Airport Rd",
+  "centroid_lat": 43.6858,
+  "centroid_lng": -79.7599
+ },
+ {
+  "store_number": 329,
+  "city": "Brampton",
+  "address": "545 Steeles Avenue East",
+  "cross_streets": "Steeles & Hwy 410",
+  "centroid_lat": 43.6858,
+  "centroid_lng": -79.7599
+ },
+ {
+  "store_number": 655,
+  "city": "Brampton",
+  "address": "9445 Mississauga Road",
+  "cross_streets": "Mississauga Rd & Williams Parkway",
+  "centroid_lat": 43.6858,
+  "centroid_lng": -79.7599
+ },
+ {
+  "store_number": 555,
+  "city": "Brampton",
+  "address": "9970 Airport Road",
+  "cross_streets": "Airport & Bovaird",
+  "centroid_lat": 43.6858,
+  "centroid_lng": -79.7599
+ },
+ {
+  "store_number": 416,
+  "city": "Brampton-Bramalea",
+  "address": "80 Peel Centre Drive, Brampton",
+  "cross_streets": "Dixie & Hwy 7",
+  "centroid_lat": 43.7014,
+  "centroid_lng": -79.692
+ },
+ {
+  "store_number": 44,
+  "city": "Brantford",
+  "address": "",
+  "cross_streets": "Market S & Icomm",
+  "centroid_lat": 43.1408,
+  "centroid_lng": -80.2632
+ },
+ {
+  "store_number": 351,
+  "city": "Brockville",
+  "address": "",
+  "cross_streets": "North Augusta & Parkdale",
+  "centroid_lat": 44.6039,
+  "centroid_lng": -75.7017
+ },
+ {
+  "store_number": 573,
+  "city": "Burlington",
+  "address": "2000 Appleby Line",
+  "cross_streets": "Appleby & Upper Middle",
+  "centroid_lat": 43.3249,
+  "centroid_lng": -79.7967
+ },
+ {
+  "store_number": 551,
+  "city": "Burlington",
+  "address": "3041 Walkers Line",
+  "cross_streets": "Walkers Line & Dundas",
+  "centroid_lat": 43.3249,
+  "centroid_lng": -79.7967
+ },
+ {
+  "store_number": 641,
+  "city": "Burlington",
+  "address": "501 Appleby Line",
+  "cross_streets": "Appleby & New",
+  "centroid_lat": 43.3249,
+  "centroid_lng": -79.7967
+ },
+ {
+  "store_number": 344,
+  "city": "Cambridge",
+  "address": "101 Holiday Inn Drive",
+  "cross_streets": "Hwy 24 & Hwy 401",
+  "centroid_lat": 43.3601,
+  "centroid_lng": -80.3123
+ },
+ {
+  "store_number": 95,
+  "city": "Cambridge",
+  "address": "200 Franklin Boulevard",
+  "cross_streets": "Franklin & Dundas",
+  "centroid_lat": 43.3601,
+  "centroid_lng": -80.3123
+ },
+ {
+  "store_number": 576,
+  "city": "Coniston",
+  "address": "",
+  "cross_streets": "Hwy 17 & 2nd",
+  "centroid_lat": 46.4867,
+  "centroid_lng": -80.8497
+ },
+ {
+  "store_number": 672,
+  "city": "Etobicoke",
+  "address": "340 Queens Plate Drive",
+  "cross_streets": "Hwy 27 & Queens Plate",
+  "centroid_lat": 43.6436,
+  "centroid_lng": -79.5656
+ },
+ {
+  "store_number": 325,
+  "city": "Guelph",
+  "address": "378 Speedvale Avenue East",
+  "cross_streets": "Speedvale & Stevenson",
+  "centroid_lat": 43.5461,
+  "centroid_lng": -80.2493
+ },
+ {
+  "store_number": 634,
+  "city": "Guelph",
+  "address": "50 Clair Road East",
+  "cross_streets": "Clair & Gordon",
+  "centroid_lat": 43.5461,
+  "centroid_lng": -80.2493
+ },
+ {
+  "store_number": 667,
+  "city": "Hamilton",
+  "address": "1550 Upper James Street",
+  "cross_streets": "Upper James & Rymal",
+  "centroid_lat": 43.2561,
+  "centroid_lng": -79.8729
+ },
+ {
+  "store_number": 165,
+  "city": "Hamilton",
+  "address": "76 Mall Road",
+  "cross_streets": "Mohawk & Upper Wentworth",
+  "centroid_lat": 43.2561,
+  "centroid_lng": -79.8729
+ },
+ {
+  "store_number": 150,
+  "city": "Hamilton-Winona",
+  "address": "1342 South Service Road, Hamilton",
+  "cross_streets": "QEW & Fifty",
+  "centroid_lat": 43.2077,
+  "centroid_lng": -79.6509
+ },
+ {
+  "store_number": 68,
+  "city": "Kenora",
+  "address": "",
+  "cross_streets": "Park & Railway",
+  "centroid_lat": 54.0246,
+  "centroid_lng": -89.1618
+ },
+ {
+  "store_number": 340,
+  "city": "Keswick",
+  "address": "",
+  "cross_streets": "Woodbine & Arlington",
+  "centroid_lat": 44.2396,
+  "centroid_lng": -79.4687
+ },
+ {
+  "store_number": 40,
+  "city": "Kingston",
+  "address": "",
+  "cross_streets": "Barrack & King",
+  "centroid_lat": 44.3054,
+  "centroid_lng": -76.4284
+ },
+ {
+  "store_number": 154,
+  "city": "Kingston",
+  "address": "",
+  "cross_streets": "Midland & Princess",
+  "centroid_lat": 44.3054,
+  "centroid_lng": -76.4284
+ },
+ {
+  "store_number": 286,
+  "city": "Kingsville",
+  "address": "",
+  "cross_streets": "Main & Jasperson",
+  "centroid_lat": 42.0379,
+  "centroid_lng": -82.7397
+ },
+ {
+  "store_number": 544,
+  "city": "Kitchener",
+  "address": "1005 Ottawa Street North",
+  "cross_streets": "Ottawa & River",
+  "centroid_lat": 43.4513,
+  "centroid_lng": -80.4928
+ },
+ {
+  "store_number": 691,
+  "city": "Kitchener",
+  "address": "123 Pioneer Drive",
+  "cross_streets": "Homer Watson & Pioneer",
+  "centroid_lat": 43.4513,
+  "centroid_lng": -80.4928
+ },
+ {
+  "store_number": 491,
+  "city": "Kitchener",
+  "address": "235 Ira Needles Boulevard",
+  "cross_streets": "Ira Needles & Highland",
+  "centroid_lat": 43.4513,
+  "centroid_lng": -80.4928
+ },
+ {
+  "store_number": 381,
+  "city": "Kitchener",
+  "address": "655 Fairway Road South",
+  "cross_streets": "Fairway & Manitou",
+  "centroid_lat": 43.4513,
+  "centroid_lng": -80.4928
+ },
+ {
+  "store_number": 27,
+  "city": "London",
+  "address": "",
+  "cross_streets": "Oxford E & Gammage",
+  "centroid_lat": 42.9837,
+  "centroid_lng": -81.2496
+ },
+ {
+  "store_number": 310,
+  "city": "London",
+  "address": "",
+  "cross_streets": "Wonderland & Oxford",
+  "centroid_lat": 42.9837,
+  "centroid_lng": -81.2496
+ },
+ {
+  "store_number": 151,
+  "city": "Marathon",
+  "address": "",
+  "cross_streets": "Ontario & Peninsula",
+  "centroid_lat": 48.7209,
+  "centroid_lng": -86.3716
+ },
+ {
+  "store_number": 390,
+  "city": "Markham",
+  "address": "192 Bullock Drive",
+  "cross_streets": "McCowan & Hwy 7",
+  "centroid_lat": 43.8564,
+  "centroid_lng": -79.3377
+ },
+ {
+  "store_number": 649,
+  "city": "Milton",
+  "address": "1025 Bronte Street South",
+  "cross_streets": "Bronte & Louis St. Laurent",
+  "centroid_lat": 43.5137,
+  "centroid_lng": -79.8828
+ },
+ {
+  "store_number": 255,
+  "city": "Milton",
+  "address": "14 Main Street East",
+  "cross_streets": "Main & Bronte",
+  "centroid_lat": 43.5137,
+  "centroid_lng": -79.8828
+ },
+ {
+  "store_number": 631,
+  "city": "Milton",
+  "address": "830 Main Street East",
+  "cross_streets": "Main & Thompson",
+  "centroid_lat": 43.5137,
+  "centroid_lng": -79.8828
+ },
+ {
+  "store_number": 425,
+  "city": "Mississauga",
+  "address": "1125 Bloor Street East",
+  "cross_streets": "Bloor & Tomken",
+  "centroid_lat": 43.5885,
+  "centroid_lng": -79.6437
+ },
+ {
+  "store_number": 321,
+  "city": "Mississauga",
+  "address": "128 Queen Street South",
+  "cross_streets": "Britannia & Queen",
+  "centroid_lat": 43.5885,
+  "centroid_lng": -79.6437
+ },
+ {
+  "store_number": 752,
+  "city": "Mississauga",
+  "address": "175 Lakeshore Road West",
+  "cross_streets": "Lakeshore & Mississauga Rd",
+  "centroid_lat": 43.5885,
+  "centroid_lng": -79.6437
+ },
+ {
+  "store_number": 640,
+  "city": "Mississauga",
+  "address": "3017 Argentia Road",
+  "cross_streets": "Winston Churchill & Hwy 401",
+  "centroid_lat": 43.5885,
+  "centroid_lng": -79.6437
+ },
+ {
+  "store_number": 542,
+  "city": "Mississauga",
+  "address": "3020 Elmcreek Road",
+  "cross_streets": "Dundas & Mavis",
+  "centroid_lat": 43.5885,
+  "centroid_lng": -79.6437
+ },
+ {
+  "store_number": 505,
+  "city": "Mississauga",
+  "address": "5035 Hurontario Street",
+  "cross_streets": "Hwy 10 & Eglinton",
+  "centroid_lat": 43.5885,
+  "centroid_lng": -79.6437
+ },
+ {
+  "store_number": 619,
+  "city": "Mississauga",
+  "address": "5100 Erin Mills Parkway",
+  "cross_streets": "Erin Mills & Eglinton",
+  "centroid_lat": 43.5885,
+  "centroid_lng": -79.6437
+ },
+ {
+  "store_number": 458,
+  "city": "Mississauga",
+  "address": "55 King St West",
+  "cross_streets": "King St W & Hurontario St",
+  "centroid_lat": 43.5885,
+  "centroid_lng": -79.6437
+ },
+ {
+  "store_number": 385,
+  "city": "Mississauga",
+  "address": "5925 Rodeo Drive",
+  "cross_streets": "Mavis & Britannia",
+  "centroid_lat": 43.5885,
+  "centroid_lng": -79.6437
+ },
+ {
+  "store_number": 698,
+  "city": "Mississauga",
+  "address": "65 Square One Drive",
+  "cross_streets": "Square One & Rathburn",
+  "centroid_lat": 43.5885,
+  "centroid_lng": -79.6437
+ },
+ {
+  "store_number": 334,
+  "city": "Mississauga",
+  "address": "6975 Meadowvale Town Centre",
+  "cross_streets": "Winston Churchill & Aquitaine",
+  "centroid_lat": 43.5885,
+  "centroid_lng": -79.6437
+ },
+ {
+  "store_number": 696,
+  "city": "Mississauga",
+  "address": "7010 Saint Barbara Boulevard",
+  "cross_streets": "Derry & McLaughlin",
+  "centroid_lat": 43.5885,
+  "centroid_lng": -79.6437
+ },
+ {
+  "store_number": 436,
+  "city": "Mississauga",
+  "address": "7205 Goreway Drive",
+  "cross_streets": "Derry & Goreway",
+  "centroid_lat": 43.5885,
+  "centroid_lng": -79.6437
+ },
+ {
+  "store_number": 371,
+  "city": "Mississauga",
+  "address": "930 Southdown Road",
+  "cross_streets": "Southdown & Royal Windsor",
+  "centroid_lat": 43.5885,
+  "centroid_lng": -79.6437
+ },
+ {
+  "store_number": 127,
+  "city": "Morrisburg",
+  "address": "",
+  "cross_streets": "Hwy 31 & 2",
+  "centroid_lat": 44.8977,
+  "centroid_lng": -75.183
+ },
+ {
+  "store_number": 453,
+  "city": "Newmarket",
+  "address": "17365 Leslie Street",
+  "cross_streets": "Leslie & Davis",
+  "centroid_lat": 44.0563,
+  "centroid_lng": -79.4617
+ },
+ {
+  "store_number": 586,
+  "city": "Niagara Falls",
+  "address": "",
+  "cross_streets": "Ferry & Stanley",
+  "centroid_lat": 43.1066,
+  "centroid_lng": -79.0639
+ },
+ {
+  "store_number": 445,
+  "city": "Oakville",
+  "address": "251 Oak Walk Drive",
+  "cross_streets": "Dundas & Trafalgar",
+  "centroid_lat": 43.4474,
+  "centroid_lng": -79.6667
+ },
+ {
+  "store_number": 486,
+  "city": "Oakville",
+  "address": "321 Cornwall Road",
+  "cross_streets": "Cornwall & Trafalgar",
+  "centroid_lat": 43.4474,
+  "centroid_lng": -79.6667
+ },
+ {
+  "store_number": 422,
+  "city": "Onaping",
+  "address": "",
+  "cross_streets": "Hwy 144 & RR 8",
+  "centroid_lat": 46.6234,
+  "centroid_lng": -81.4156
+ },
+ {
+  "store_number": 298,
+  "city": "Orangeville",
+  "address": "40 Broadway",
+  "cross_streets": "Broadway & Townline",
+  "centroid_lat": 43.9193,
+  "centroid_lng": -80.0974
+ },
+ {
+  "store_number": 465,
+  "city": "Oshawa",
+  "address": "1409 Harmony Road",
+  "cross_streets": "Harmony & Taunton",
+  "centroid_lat": 43.8976,
+  "centroid_lng": -78.8635
+ },
+ {
+  "store_number": 753,
+  "city": "Oshawa",
+  "address": "2610 Simcoe Street North",
+  "cross_streets": "Simcoe & Winchester",
+  "centroid_lat": 43.8976,
+  "centroid_lng": -78.8635
+ },
+ {
+  "store_number": 368,
+  "city": "Ottawa",
+  "address": "",
+  "cross_streets": "Bank & Findlay Creek",
+  "centroid_lat": 45.4209,
+  "centroid_lng": -75.6901
+ },
+ {
+  "store_number": 243,
+  "city": "Ottawa",
+  "address": "",
+  "cross_streets": "Bank & Walkley",
+  "centroid_lat": 45.4209,
+  "centroid_lng": -75.6901
+ },
+ {
+  "store_number": 945,
+  "city": "Ottawa",
+  "address": "",
+  "cross_streets": "Bank St",
+  "centroid_lat": 45.4209,
+  "centroid_lng": -75.6901
+ },
+ {
+  "store_number": 394,
+  "city": "Ottawa",
+  "address": "",
+  "cross_streets": "Carling & Woodroffe",
+  "centroid_lat": 45.4209,
+  "centroid_lng": -75.6901
+ },
+ {
+  "store_number": 699,
+  "city": "Ottawa",
+  "address": "",
+  "cross_streets": "Limebank & Spratt",
+  "centroid_lat": 45.4209,
+  "centroid_lng": -75.6901
+ },
+ {
+  "store_number": 384,
+  "city": "Ottawa",
+  "address": "",
+  "cross_streets": "Metcalfe & Isabella",
+  "centroid_lat": 45.4209,
+  "centroid_lng": -75.6901
+ },
+ {
+  "store_number": 38,
+  "city": "Ottawa",
+  "address": "",
+  "cross_streets": "Rideau & King Edward",
+  "centroid_lat": 45.4209,
+  "centroid_lng": -75.6901
+ },
+ {
+  "store_number": 638,
+  "city": "Ottawa-Kanata",
+  "address": "",
+  "cross_streets": "March & Maxwell Bridge",
+  "centroid_lat": 45.3659,
+  "centroid_lng": -75.9655
+ },
+ {
+  "store_number": 556,
+  "city": "Ottawa-Kanata",
+  "address": "",
+  "cross_streets": "Terry Fox & Campeau",
+  "centroid_lat": 45.3659,
+  "centroid_lng": -75.9655
+ },
+ {
+  "store_number": 412,
+  "city": "Ottawa-Nepean",
+  "address": "",
+  "cross_streets": "Hunt Club & Merivale",
+  "centroid_lat": 45.2862,
+  "centroid_lng": -75.7512
+ },
+ {
+  "store_number": 388,
+  "city": "Ottawa-Nepean",
+  "address": "",
+  "cross_streets": "Robertson & Stafford",
+  "centroid_lat": 45.2862,
+  "centroid_lng": -75.7512
+ },
+ {
+  "store_number": 499,
+  "city": "Ottawa-Nepean",
+  "address": "",
+  "cross_streets": "Strandherd & Greenbank",
+  "centroid_lat": 45.2862,
+  "centroid_lng": -75.7512
+ },
+ {
+  "store_number": 670,
+  "city": "Ottawa-Nepean",
+  "address": "",
+  "cross_streets": "Strandherd & Maravista",
+  "centroid_lat": 45.2862,
+  "centroid_lng": -75.7512
+ },
+ {
+  "store_number": 431,
+  "city": "Ottawa-Nepean",
+  "address": "",
+  "cross_streets": "Woodroffe & Baseline",
+  "centroid_lat": 45.2862,
+  "centroid_lng": -75.7512
+ },
+ {
+  "store_number": 624,
+  "city": "Ottawa-Orleans",
+  "address": "",
+  "cross_streets": "Innes & Tenth Line",
+  "centroid_lat": 45.4654,
+  "centroid_lng": -75.5035
+ },
+ {
+  "store_number": 140,
+  "city": "Ottawa-Vanier",
+  "address": "",
+  "cross_streets": "Montreal & Vanier Parkway",
+  "centroid_lat": 45.4372,
+  "centroid_lng": -75.665
+ },
+ {
+  "store_number": 358,
+  "city": "Peterborough",
+  "address": "",
+  "cross_streets": "Chemong & Milroy",
+  "centroid_lat": 44.3048,
+  "centroid_lng": -78.3199
+ },
+ {
+  "store_number": 35,
+  "city": "Peterborough",
+  "address": "",
+  "cross_streets": "Lansdowne W & Parkway",
+  "centroid_lat": 44.3048,
+  "centroid_lng": -78.3199
+ },
+ {
+  "store_number": 45,
+  "city": "Peterborough",
+  "address": "",
+  "cross_streets": "Sherbrooke & George",
+  "centroid_lat": 44.3048,
+  "centroid_lng": -78.3199
+ },
+ {
+  "store_number": 776,
+  "city": "Pickering",
+  "address": "1899 Brock Road",
+  "cross_streets": "Brock & Kingston",
+  "centroid_lat": 43.8358,
+  "centroid_lng": -79.0906
+ },
+ {
+  "store_number": 629,
+  "city": "Richmond Hill",
+  "address": "1520 Major Mackenzie Dr East",
+  "cross_streets": "Major Mackenzie & Leslie",
+  "centroid_lat": 43.8801,
+  "centroid_lng": -79.4393
+ },
+ {
+  "store_number": 459,
+  "city": "Sarnia",
+  "address": "",
+  "cross_streets": "Exmouth & Lambton Mall",
+  "centroid_lat": 42.9744,
+  "centroid_lng": -82.4035
+ },
+ {
+  "store_number": 252,
+  "city": "St. Catharines",
+  "address": "",
+  "cross_streets": "Glendale & Merritt",
+  "centroid_lat": 43.158,
+  "centroid_lng": -79.2441
+ },
+ {
+  "store_number": 392,
+  "city": "St. Catharines",
+  "address": "",
+  "cross_streets": "Vansickle & Fourth",
+  "centroid_lat": 43.158,
+  "centroid_lng": -79.2441
+ },
+ {
+  "store_number": 289,
+  "city": "St. Marys",
+  "address": "",
+  "cross_streets": "Wellington & Parkview",
+  "centroid_lat": 43.2571,
+  "centroid_lng": -81.1409
+ },
+ {
+  "store_number": 680,
+  "city": "Stittsville",
+  "address": "",
+  "cross_streets": "Cope & Terry Fox",
+  "centroid_lat": 45.2585,
+  "centroid_lng": -75.9206
+ },
+ {
+  "store_number": 404,
+  "city": "Stouffville",
+  "address": "",
+  "cross_streets": "Main & Mostar",
+  "centroid_lat": 43.9718,
+  "centroid_lng": -79.2454
+ },
+ {
+  "store_number": 644,
+  "city": "Stratford",
+  "address": "",
+  "cross_streets": "Ontario & C.H. Meir",
+  "centroid_lat": 43.3701,
+  "centroid_lng": -80.9818
+ },
+ {
+  "store_number": 50,
+  "city": "Sudbury",
+  "address": "",
+  "cross_streets": "Elm & Paris",
+  "centroid_lat": 46.4927,
+  "centroid_lng": -80.9912
+ },
+ {
+  "store_number": 652,
+  "city": "Sudbury",
+  "address": "",
+  "cross_streets": "Kingsway & Barrydowne",
+  "centroid_lat": 46.4927,
+  "centroid_lng": -80.9912
+ },
+ {
+  "store_number": 523,
+  "city": "Thornhill",
+  "address": "180 Promenade Circle",
+  "cross_streets": "Bathurst & Centre",
+  "centroid_lat": 43.8219,
+  "centroid_lng": -79.4738
+ },
+ {
+  "store_number": 155,
+  "city": "Thunder Bay",
+  "address": "",
+  "cross_streets": "Cumberland & Water",
+  "centroid_lat": 48.4064,
+  "centroid_lng": -89.2598
+ },
+ {
+  "store_number": 58,
+  "city": "Timmins",
+  "address": "",
+  "cross_streets": "Algonquin & Texas Gulf Rd",
+  "centroid_lat": 48.4775,
+  "centroid_lng": -81.3304
+ },
+ {
+  "store_number": 10,
+  "city": "Toronto",
+  "address": "10 Scrivener Square",
+  "cross_streets": "Yonge & Summerhill",
+  "centroid_lat": 43.6535,
+  "centroid_lng": -79.3839
+ },
+ {
+  "store_number": 7,
+  "city": "Toronto",
+  "address": "101 Eglinton Avenue East",
+  "cross_streets": "Eglinton & Dunfield",
+  "centroid_lat": 43.6535,
+  "centroid_lng": -79.3839
+ },
+ {
+  "store_number": 3,
+  "city": "Toronto",
+  "address": "1230 Dundas Street West",
+  "cross_streets": "Dundas & Dovercourt",
+  "centroid_lat": 43.6535,
+  "centroid_lng": -79.3839
+ },
+ {
+  "store_number": 789,
+  "city": "Toronto",
+  "address": "145 Silver Reign Drive",
+  "cross_streets": "Islington & Hwy 401",
+  "centroid_lat": 43.6535,
+  "centroid_lng": -79.3839
+ },
+ {
+  "store_number": 217,
+  "city": "Toronto",
+  "address": "15 Cooper Street",
+  "cross_streets": "Queens Quay & Cooper St",
+  "centroid_lat": 43.6535,
+  "centroid_lng": -79.3839
+ },
+ {
+  "store_number": 19,
+  "city": "Toronto",
+  "address": "2151 St. Clair Avenue West",
+  "cross_streets": "St. Clair & Keele",
+  "centroid_lat": 43.6535,
+  "centroid_lng": -79.3839
+ },
+ {
+  "store_number": 534,
+  "city": "Toronto",
+  "address": "2290 Dundas Street West",
+  "cross_streets": "Dundas & Bloor",
+  "centroid_lat": 43.6535,
+  "centroid_lng": -79.3839
+ },
+ {
+  "store_number": 757,
+  "city": "Toronto",
+  "address": "2409 Dufferin Street",
+  "cross_streets": "Dufferin & Eglinton",
+  "centroid_lat": 43.6535,
+  "centroid_lng": -79.3839
+ },
+ {
+  "store_number": 693,
+  "city": "Toronto",
+  "address": "272 Queen Street West",
+  "cross_streets": "Queen & Beverley",
+  "centroid_lat": 43.6535,
+  "centroid_lng": -79.3839
+ },
+ {
+  "store_number": 754,
+  "city": "Toronto",
+  "address": "4 King Street West",
+  "cross_streets": "Yonge & King",
+  "centroid_lat": 43.6535,
+  "centroid_lng": -79.3839
+ },
+ {
+  "store_number": 748,
+  "city": "Toronto",
+  "address": "420 Progress Avenue",
+  "cross_streets": "Brimley & Progress",
+  "centroid_lat": 43.6535,
+  "centroid_lng": -79.3839
+ },
+ {
+  "store_number": 320,
+  "city": "Toronto",
+  "address": "45 Overlea Boulevard",
+  "cross_streets": "Overlea & Millwood",
+  "centroid_lat": 43.6535,
+  "centroid_lng": -79.3839
+ },
+ {
+  "store_number": 411,
+  "city": "Toronto",
+  "address": "547 Yonge Street",
+  "cross_streets": "Yonge & Wellesley",
+  "centroid_lat": 43.6535,
+  "centroid_lng": -79.3839
+ },
+ {
+  "store_number": 164,
+  "city": "Toronto",
+  "address": "65 Wicksteed Avenue",
+  "cross_streets": "Eglinton & Laird",
+  "centroid_lat": 43.6535,
+  "centroid_lng": -79.3839
+ },
+ {
+  "store_number": 772,
+  "city": "Toronto",
+  "address": "770 Bathurst Street",
+  "cross_streets": "Bathurst & Bloor",
+  "centroid_lat": 43.6535,
+  "centroid_lng": -79.3839
+ },
+ {
+  "store_number": 532,
+  "city": "Toronto",
+  "address": "87 Front Street East",
+  "cross_streets": "Front & Jarvis",
+  "centroid_lat": 43.6535,
+  "centroid_lng": -79.3839
+ },
+ {
+  "store_number": 362,
+  "city": "Toronto-Etobicoke",
+  "address": "1530 Albion Road, Toronto",
+  "cross_streets": "Albion & Kipling",
+  "centroid_lat": 43.6436,
+  "centroid_lng": -79.5656
+ },
+ {
+  "store_number": 553,
+  "city": "Toronto-Etobicoke",
+  "address": "1750 The Queensway, Toronto",
+  "cross_streets": "Queensway & Hwy 427",
+  "centroid_lat": 43.6436,
+  "centroid_lng": -79.5656
+ },
+ {
+  "store_number": 20,
+  "city": "Toronto-Etobicoke",
+  "address": "2762 Lake Shore Boulevard West, Toronto",
+  "cross_streets": "Lake Shore & Islington",
+  "centroid_lat": 43.6436,
+  "centroid_lng": -79.5656
+ },
+ {
+  "store_number": 398,
+  "city": "Toronto-Etobicoke",
+  "address": "662 Burnhamthorpe Road, Toronto",
+  "cross_streets": "Burnhamthorpe & Hwy 427",
+  "centroid_lat": 43.6436,
+  "centroid_lng": -79.5656
+ },
+ {
+  "store_number": 408,
+  "city": "Toronto-North York",
+  "address": "1 York Gate Boulevard, Toronto",
+  "cross_streets": "Jane & Finch",
+  "centroid_lat": 43.7543,
+  "centroid_lng": -79.4491
+ },
+ {
+  "store_number": 642,
+  "city": "Toronto-North York",
+  "address": "1115 Lodestar Road, Toronto",
+  "cross_streets": "Allen & Rimrock",
+  "centroid_lat": 43.7543,
+  "centroid_lng": -79.4491
+ },
+ {
+  "store_number": 546,
+  "city": "Toronto-North York",
+  "address": "1800 Sheppard Avenue East, Toronto",
+  "cross_streets": "Don Mills & Sheppard",
+  "centroid_lat": 43.7543,
+  "centroid_lng": -79.4491
+ },
+ {
+  "store_number": 1,
+  "city": "Toronto-North York",
+  "address": "2625 Weston Road, Toronto",
+  "cross_streets": "Hwy 401 & Weston",
+  "centroid_lat": 43.7543,
+  "centroid_lng": -79.4491
+ },
+ {
+  "store_number": 16,
+  "city": "Toronto-North York",
+  "address": "5095 Yonge Street, Toronto",
+  "cross_streets": "Yonge & Empress",
+  "centroid_lat": 43.7543,
+  "centroid_lng": -79.4491
+ },
+ {
+  "store_number": 195,
+  "city": "Toronto-Scarborough",
+  "address": "1900 Eglinton Avenue East, Toronto",
+  "cross_streets": "Eglinton & Warden",
+  "centroid_lat": 43.773,
+  "centroid_lng": -79.2576
+ },
+ {
+  "store_number": 700,
+  "city": "Toronto-Scarborough",
+  "address": "21 William Kitchen Road, Toronto",
+  "cross_streets": "Kennedy & Hwy 401",
+  "centroid_lat": 43.773,
+  "centroid_lng": -79.2576
+ },
+ {
+  "store_number": 564,
+  "city": "Toronto-Scarborough",
+  "address": "2946 Finch Avenue East, Toronto",
+  "cross_streets": "Victoria Park & Finch",
+  "centroid_lat": 43.773,
+  "centroid_lng": -79.2576
+ },
+ {
+  "store_number": 269,
+  "city": "Toronto-Scarborough",
+  "address": "3441 Lawrence Avenue East, Toronto",
+  "cross_streets": "Markham & Lawrence",
+  "centroid_lat": 43.773,
+  "centroid_lng": -79.2576
+ },
+ {
+  "store_number": 198,
+  "city": "Toronto-Scarborough",
+  "address": "4525 Kingston Road, Toronto",
+  "cross_streets": "Kingston & Morningside",
+  "centroid_lat": 43.773,
+  "centroid_lng": -79.2576
+ },
+ {
+  "store_number": 228,
+  "city": "Toronto-Scarborough",
+  "address": "55 Ellesmere Road, Toronto",
+  "cross_streets": "Ellesmere & Victoria Park",
+  "centroid_lat": 43.773,
+  "centroid_lng": -79.2576
+ },
+ {
+  "store_number": 703,
+  "city": "Toronto-Scarborough",
+  "address": "5979 Steeles Avenue East, Toronto",
+  "cross_streets": "Steeles & Markham",
+  "centroid_lat": 43.773,
+  "centroid_lng": -79.2576
+ },
+ {
+  "store_number": 428,
+  "city": "Toronto-Scarborough",
+  "address": "785 Milner Avenue, Toronto",
+  "cross_streets": "Morningside & Hwy 401",
+  "centroid_lat": 43.773,
+  "centroid_lng": -79.2576
+ },
+ {
+  "store_number": 397,
+  "city": "Vaughan",
+  "address": "3631 Major Mackenzie Drive",
+  "cross_streets": "Major Mackenzie & Weston",
+  "centroid_lat": 43.7942,
+  "centroid_lng": -79.5268
+ },
+ {
+  "store_number": 383,
+  "city": "Vaughan",
+  "address": "9970 Dufferin Street",
+  "cross_streets": "Dufferin & Major Mackenzie",
+  "centroid_lat": 43.7942,
+  "centroid_lng": -79.5268
+ },
+ {
+  "store_number": 326,
+  "city": "Waterdown",
+  "address": "74 Dundas Street East",
+  "cross_streets": "Hwy 5 & Hwy 6",
+  "centroid_lat": 43.3314,
+  "centroid_lng": -79.8957
+ },
+ {
+  "store_number": 115,
+  "city": "Waterloo",
+  "address": "115 King Street South",
+  "cross_streets": "King S & William",
+  "centroid_lat": 43.4653,
+  "centroid_lng": -80.5223
+ },
+ {
+  "store_number": 432,
+  "city": "Whitby",
+  "address": "170 Taunton Road West",
+  "cross_streets": "Taunton & Brock",
+  "centroid_lat": 43.8798,
+  "centroid_lng": -78.9422
+ },
+ {
+  "store_number": 367,
+  "city": "Windsor",
+  "address": "",
+  "cross_streets": "Howard & E.C. Row Expressway",
+  "centroid_lat": 42.2859,
+  "centroid_lng": -82.9781
+ },
+ {
+  "store_number": 539,
+  "city": "Windsor",
+  "address": "",
+  "cross_streets": "Tecumseh & Huron Line",
+  "centroid_lat": 42.2859,
+  "centroid_lng": -82.9781
+ },
+ {
+  "store_number": 32,
+  "city": "Windsor",
+  "address": "",
+  "cross_streets": "University & Church",
+  "centroid_lat": 42.2859,
+  "centroid_lng": -82.9781
+ },
+ {
+  "store_number": 34,
+  "city": "Windsor",
+  "address": "",
+  "cross_streets": "Walker & Ottawa",
+  "centroid_lat": 42.2859,
+  "centroid_lng": -82.9781
+ },
+ {
+  "store_number": 632,
+  "city": "Woodbridge",
+  "address": "8260 Highway 27",
+  "cross_streets": "Hwy 27 & Innovation",
+  "centroid_lat": 43.7849,
+  "centroid_lng": -79.5924
+ },
+ {
+  "store_number": 64,
+  "city": "Woodstock",
+  "address": "",
+  "cross_streets": "Dundas & Springbank",
+  "centroid_lat": 43.1301,
+  "centroid_lng": -80.7563
+ }
+]

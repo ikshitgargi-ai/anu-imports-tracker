@@ -1,0 +1,85 @@
+name: Uptime Watchdog
+
+# External liveness check that runs INSIDE GitHub (not the app itself), so it
+# still fires alerts when the backend is dead. Pings /healthz every 5 minutes
+# and emails when it can't reach the service or the response says unhealthy.
+#
+# Required repo secrets:
+#   BACKEND_URL          (e.g. https://anu-imports-tracker.onrender.com)
+#   RESEND_API_KEY       (free tier 100/day, plenty for watchdog pings)
+#   ALERT_EMAIL_TO       (comma-separated)
+#   ALERT_EMAIL_FROM     (e.g. alerts@yourdomain.com — must be verified in Resend)
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 minutes
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping /healthz
+        id: ping
+        env:
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+        run: |
+          set +e
+          # 30s budget; healthy if HTTP 200 AND response includes "status":"healthy"
+          out=$(curl -s -o /tmp/body --max-time 30 -w "%{http_code}" "${BACKEND_URL}/healthz")
+          code="$out"
+          body="$(cat /tmp/body 2>/dev/null || echo '')"
+          echo "code=$code"
+          echo "body=$body"
+          # Pass = 200 AND status:healthy
+          if [ "$code" = "200" ] && echo "$body" | grep -q '"status":"healthy"'; then
+            echo "status=ok" >> $GITHUB_OUTPUT
+          else
+            echo "status=down" >> $GITHUB_OUTPUT
+            echo "code=$code" >> $GITHUB_OUTPUT
+            echo "body<<EOF" >> $GITHUB_OUTPUT
+            echo "$body" | head -c 500 >> $GITHUB_OUTPUT
+            echo "" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Email alert on failure
+        if: steps.ping.outputs.status == 'down'
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+          BODY: ${{ steps.ping.outputs.body }}
+          CODE: ${{ steps.ping.outputs.code }}
+        run: |
+          # Build JSON payload
+          to_json=$(echo "$ALERT_EMAIL_TO" | python3 -c '
+import sys, json
+addrs = [a.strip() for a in sys.stdin.read().split(",") if a.strip()]
+print(json.dumps(addrs))
+')
+          payload=$(python3 -c "
+import json, os
+print(json.dumps({
+    'from': os.environ.get('ALERT_EMAIL_FROM','alerts@example.com'),
+    'to': $to_json,
+    'subject': '[Anu Imports] 🔴 Backend DOWN — uptime watchdog',
+    'text': f'''The uptime watchdog could not reach {os.environ['BACKEND_URL']}/healthz.
+
+HTTP code: {os.environ.get('CODE','000')}
+Response (first 500 chars):
+{os.environ.get('BODY','(empty/timeout)')}
+
+Time: {os.popen('date -u').read().strip()}
+
+This check runs every 5 minutes via GitHub Actions and only emails when the
+service stops responding or returns unhealthy. If you receive this, log into
+your hosting dashboard and check service health.'''
+}))
+")
+          curl -fsS -X POST https://api.resend.com/emails \
+            -H "Authorization: Bearer $RESEND_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$payload"
