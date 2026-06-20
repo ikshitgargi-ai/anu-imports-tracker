@@ -20,17 +20,14 @@ Neon project**. Never paste the NB tracker's database URL into this app.
 3. Copy the **pooled** connection string it shows (looks like
    `postgresql://...-pooler...neon.tech/neondb?sslmode=require`). Keep it handy.
 
-## Step 2 — Push the code to GitHub · ~3 min
-Both folders are **already git-initialized with clean history and the correct
-remotes** (this was important — the copies had inherited the NB tracker's remote,
-which I removed so a push can never hit the NB repos):
-- `anu-imports-tracker/`  → `github.com/ikshitgargi-ai/anu-imports-tracker`
-- `anu-imports-web/`      → `github.com/ikshitgargi-ai/anu-imports-web`
+## Step 2 — Push the code to GitHub · ✅ DONE
+Both repos are created (public, under `ikshitgargi-ai`) and pushed:
+- `github.com/ikshitgargi-ai/anu-imports-tracker` (backend, 30 files)
+- `github.com/ikshitgargi-ai/anu-imports-web` (frontend, 89 files)
 
-Create the two **empty** repos on github.com (same `ikshitgargi-ai` account as the
-NB tracker), then from each folder run `git push -u origin main`. If you'd rather, I
-can run the pushes for you once the empty repos exist and the GitHub CLI (`gh`) is
-installed/authorized on this Mac — just say so.
+Verified clean — no `.env`, no database, no secrets committed (all gitignored). The
+copies had inherited the NB tracker's git remote; that was removed and replaced with
+each app's own remote, so a push here can never touch the NB repos.
 
 ## Step 3 — Backend (Render) · ~8 min
 1. **render.com** → **New** → **Blueprint** → pick the `anu-imports-tracker` repo.
