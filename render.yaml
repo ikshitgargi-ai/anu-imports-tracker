@@ -6,7 +6,7 @@ services:
     buildCommand: pip install -r requirements.txt
     # Long timeout for the Daily A SOD sync (1.5M rows can take ~22 min)
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 1800 --workers 1
-    plan: starter  # $7/mo always-on — no ~50s cold starts when a rep opens it in-store (matches NB tracker)
+    plan: free  # free tier (no card needed). ~50s cold start after idle. Upgrade to 'starter' ($7/mo) anytime for always-on — one click in the Render dashboard.
     healthCheckPath: /healthz
     # ENV VALUES: copy the CURRENT values from the lcbo-tracker Render service
     # (same SOD account) — EXCEPT DATABASE_URL, which must be a NEW separate
