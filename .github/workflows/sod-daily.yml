@@ -1,0 +1,11 @@
+name: Daily SOD sync
+on:
+  schedule:
+    - cron: "15 8 * * *"
+  workflow_dispatch:
+jobs:
+  sod:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -fsS --max-time 120 https://anu-imports-tracker.onrender.com/healthz || true
+      - run: 'curl -fsS --max-time 180 -X POST -H "Authorization: Bearer ${{ secrets.SOD_CRON_TOKEN }}" https://anu-imports-tracker.onrender.com/api/sod/cron'
