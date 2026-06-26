@@ -22351,7 +22351,7 @@ def api_horeca_nearby():
         params.append(type_f)
     rows = db_fetchall(
         "SELECT id, name, account_type, status, address, city, postal, phone, lat, lng, "
-        "COALESCE(last_visit,'') AS last_visit, COALESCE(products_carried,'') AS products_carried, "
+        "COALESCE(CAST(last_visit AS TEXT),'') AS last_visit, COALESCE(products_carried,'') AS products_carried, "
         "COALESCE(source,'manual') AS source FROM horeca_accounts WHERE " + " AND ".join(where), params)
     results, seen = [], set()
     for r in rows:
