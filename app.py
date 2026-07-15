@@ -21733,8 +21733,13 @@ def api_crm_reps_with_stores():
 _lcbo_scheduler = None
 
 
-def _lcbo_daily_scrape_worker():
+def _lcbo_daily_scrape_worker(per_sku_rows=None):
     """Scrape live LCBO.com inventory + RECONCILE with SOD + AUTO-ONBOARD stores.
+
+    per_sku_rows: optional {sku(7-char padded): [row dicts]} already scraped by
+    run_live_batch() — when provided, NO extra HTTP requests are made (one
+    scrape per scheduler cycle feeds both this reconciler and the append-only
+    lcbo_live_snapshots engine).
 
     Three outputs:
       1. inventory_history: append-only trend log.
@@ -21768,11 +21773,18 @@ def _lcbo_daily_scrape_worker():
         for sku, (brand, pname) in SOD_TRACKED_SKUS.items():
             sku_clean = sku.lstrip('0')
             sku_padded = sku  # already 7-char zero-padded in SOD_TRACKED_SKUS
-            try:
-                rows = scrape(sku_clean) or []
-            except Exception as e:
-                print(f'[LCBO-live] scrape failed for {sku}: {e}')
-                continue
+            if per_sku_rows is not None:
+                rows = per_sku_rows.get(sku_padded) or per_sku_rows.get(sku_clean) or []
+            else:
+                try:
+                    # scrape_lcbo_inventory returns (rows, err) — unpack it.
+                    rows, _scrape_err = scrape(sku_clean)
+                    rows = rows or []
+                    if _scrape_err:
+                        print(f'[LCBO-live] scrape issue for {sku}: {_scrape_err}')
+                except Exception as e:
+                    print(f'[LCBO-live] scrape failed for {sku}: {e}')
+                    continue
 
             # Find product row for inventory_history
             if USE_POSTGRES:
@@ -23172,6 +23184,668 @@ def api_reports_compare():
         deltas[k] = {'a': a['metrics'].get(k, 0), 'b': b['metrics'].get(k, 0),
                      'abs_change': round(bv - av, 2), 'pct_change': pct}
     return jsonify({'a': a, 'b': b, 'deltas': deltas})
+
+
+# ============================================================================
+# LIVE LCBO.COM ENGINE + SOD-vs-LIVE RECONCILIATION (ported from the proven
+# Dripp Tracker engine, 2026-07-14)
+# ============================================================================
+# What lives here:
+#   - lcbo_live_snapshots     APPEND-ONLY live scrape of lcbo.com (hourly cadence)
+#   - lcbo_live_batches       one row per scrape batch (all 9 tracked SKUs)
+#   - live_listing_events     listing changes detected between live batches
+#   - /api/live/refresh       on-demand batch (admin / app origin / cron bearer)
+#   - /api/live/latest        latest batch per store, per SKU
+#   - /api/live/store/<n>     time series of live snapshots for one store
+#   - /api/reconcile          SOD on_hand vs lcbo.com qty, per (sku, store)
+# Nothing here ever deletes or overwrites a snapshot. Money depends on it.
+
+from html import unescape as _html_unescape
+
+# Proven row regex for https://www.lcbo.com/en/storeinventory/?sku=N —
+# extracts (city, name, address, qty, store#). DOTALL because the markup
+# spans lines between the <p> blocks.
+LIVE_ROW_RE = re.compile(
+    r'<p class="city_txt">(.*?)</p>.*?<p class="name_txt">(.*?)</p>.*?'
+    r'<p class="address_txt">(.*?)</p>.*?<p class="quantity_avail_txt">(\d+)</p>.*?'
+    r'href="https://www\.lcbo\.com/en/stores/[a-z0-9-]*?(\d+)"',
+    re.DOTALL,
+)
+
+# Polite gap between the per-SKU requests in one batch (9 tracked SKUs).
+# Module-level so tests can zero it out.
+LIVE_SCRAPE_GAP_SECONDS = 3
+
+_live_batch_lock = threading.Lock()
+
+_LIVE_TABLES_READY = False
+
+
+def _pad_sku(sku) -> str:
+    """Normalize any SKU spelling ('45378' / '0045378') to the 7-char padded form."""
+    return str(sku or '').strip().zfill(7)
+
+
+def _ensure_live_tables(db):
+    """Idempotent DDL for the live-engine tables (both Postgres and SQLite).
+
+    Lazily called (same pattern as _ensure_horeca_v2) so the giant init
+    functions stay untouched. Never destructive.
+    """
+    global _LIVE_TABLES_READY
+    if _LIVE_TABLES_READY:
+        return
+    pk = 'BIGSERIAL PRIMARY KEY' if USE_POSTGRES else 'INTEGER PRIMARY KEY AUTOINCREMENT'
+    now_default = 'NOW()' if USE_POSTGRES else 'CURRENT_TIMESTAMP'
+    event_date_type = 'DATE' if USE_POSTGRES else 'TEXT'
+    stmts = [
+        # lcbo_live_snapshots — APPEND-ONLY per-store rows from the lcbo.com
+        # storeinventory scrape. Never updated, never deleted.
+        f'''CREATE TABLE IF NOT EXISTS lcbo_live_snapshots (
+                id {pk},
+                sku TEXT NOT NULL,
+                store_number INTEGER NOT NULL,
+                qty INTEGER DEFAULT 0,
+                store_name TEXT DEFAULT '',
+                city TEXT DEFAULT '',
+                checked_at TIMESTAMP DEFAULT {now_default},
+                batch_id TEXT NOT NULL
+            )''',
+        # lcbo_live_batches — one row per scrape batch (all tracked SKUs).
+        # Failures are recorded HERE with the error text; prior snapshots are
+        # never touched.
+        f'''CREATE TABLE IF NOT EXISTS lcbo_live_batches (
+                id {pk},
+                batch_id TEXT UNIQUE NOT NULL,
+                started_at TIMESTAMP DEFAULT {now_default},
+                finished_at TIMESTAMP,
+                triggered_by TEXT DEFAULT 'scheduler',
+                skus TEXT DEFAULT '',
+                row_count INTEGER DEFAULT 0,
+                store_count INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'running',
+                error TEXT DEFAULT ''
+            )''',
+        # live_listing_events — APPEND-ONLY listing changes detected from
+        # live snapshots (store appears/disappears/restocks on lcbo.com
+        # between batches) so we don't wait a day for SOD.
+        f'''CREATE TABLE IF NOT EXISTS live_listing_events (
+                id {pk},
+                sku TEXT NOT NULL,
+                store_number INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                old_qty INTEGER,
+                new_qty INTEGER,
+                batch_id TEXT DEFAULT '',
+                prev_batch_id TEXT DEFAULT '',
+                event_date {event_date_type},
+                detected_at TIMESTAMP DEFAULT {now_default},
+                UNIQUE(sku, store_number, event_type, batch_id)
+            )''',
+        "CREATE INDEX IF NOT EXISTS idx_live_snap ON lcbo_live_snapshots(sku, store_number, checked_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_live_snap_batch ON lcbo_live_snapshots(batch_id)",
+        "CREATE INDEX IF NOT EXISTS idx_live_events_date ON live_listing_events(event_date)",
+    ]
+    if USE_POSTGRES:
+        cur = db.cursor()
+        for s in stmts:
+            cur.execute(s)
+        db.commit()
+        cur.close()
+    else:
+        for s in stmts:
+            db.execute(s)
+        db.commit()
+    _LIVE_TABLES_READY = True
+
+
+def _live_scrape_sku(sku):
+    """Scrape live per-store inventory for one SKU from lcbo.com storeinventory.
+
+    Returns (rows, err). Row dicts are shaped like scrape_lcbo_inventory()'s
+    output so they can feed _lcbo_daily_scrape_worker(per_sku_rows=...)
+    without re-fetching. Timeout 45s.
+    """
+    if not http_requests:
+        return [], 'requests library unavailable'
+    sku_clean = str(sku).lstrip('0') or '0'
+    try:
+        resp = http_requests.get(
+            f'{LCBO_STORE_INVENTORY_URL}?sku={sku_clean}',
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-CA,en;q=0.9',
+            },
+            timeout=45,
+            allow_redirects=True,
+        )
+        if resp.status_code != 200:
+            return [], f'http {resp.status_code}'
+        rows = []
+        seen_stores = set()
+        for city, name, address, qty, store_num in LIVE_ROW_RE.findall(resp.text):
+            try:
+                sn = int(store_num)
+                qty_int = int(qty)
+            except (TypeError, ValueError):
+                continue
+            if sn in seen_stores:
+                # lcbo.com renders each store block twice on this page
+                # (verified 2026-07-14: 238 regex matches -> 119 distinct
+                # stores for 14318, identical qty in every pair). One row
+                # per store, or every downstream count doubles.
+                continue
+            seen_stores.add(sn)
+            rows.append({
+                'store_number': str(sn),
+                'city': _html_unescape(city).strip(),
+                'intersection': _html_unescape(name).strip(),
+                'store_name': _html_unescape(name).strip(),
+                'address': _html_unescape(re.sub(r'<[^>]+>', ' ', address)).strip(),
+                'phone': '',
+                'quantity': qty_int,
+            })
+        if not rows:
+            return [], 'no store rows parsed — product may be delisted or page layout changed'
+        return rows, None
+    except Exception as e:
+        return [], f'scrape error: {e}'
+
+
+def run_live_batch(triggered_by='scheduler'):
+    """One live scrape batch: ALL tracked SKUs, polite gap apart, APPEND-ONLY writes.
+
+    - lcbo_live_batches gets one row per batch; failures are recorded there
+      with the error text. Prior snapshots are NEVER touched (no partial
+      overwrite, no updates, no deletes).
+    - lcbo_live_snapshots gets one row per (sku, store) seen.
+    - live_listing_events records stores that appear / disappear / restock
+      versus the previous batch for that SKU, so we don't wait a day for SOD.
+    - Feeds _lcbo_daily_scrape_worker(per_sku_rows=...) with the scraped rows
+      so the legacy reconciler + auto-onboard run WITHOUT extra HTTP requests.
+
+    Runs from the scheduler thread — uses its own connection, never Flask g.
+    Returns a summary dict; never raises.
+    """
+    import uuid as _uuid
+    import time as _time
+    if not _live_batch_lock.acquire(blocking=False):
+        return {'status': 'already_running'}
+    conn = None
+    batch_id = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ') + '-' + _uuid.uuid4().hex[:6]
+    try:
+        skus = sorted(SOD_TRACKED_SKUS.keys())
+        conn = _sod_get_conn()
+        _ensure_live_tables(conn)
+        cur = conn.cursor()
+        ph = _sod_ph()
+        cur.execute(
+            f"INSERT INTO lcbo_live_batches (batch_id, triggered_by, skus, status) "
+            f"VALUES ({ph},{ph},{ph},'running')",
+            (batch_id, triggered_by, ','.join(skus)),
+        )
+        conn.commit()
+
+        errors = []
+        row_count = 0
+        store_set = set()
+        events_created = 0
+        per_sku_rows = {}
+        today_str = _toronto_today().isoformat()
+
+        for i, sku in enumerate(skus):
+            if i > 0:
+                _time.sleep(LIVE_SCRAPE_GAP_SECONDS)
+            rows, err = _live_scrape_sku(sku)
+            if err and not rows:
+                errors.append(f'{sku}: {err}')
+                continue
+            per_sku_rows[sku] = rows
+
+            # Previous batch for THIS sku = event-detection baseline.
+            cur.execute(
+                f"SELECT batch_id FROM lcbo_live_snapshots WHERE sku={ph} "
+                f"ORDER BY id DESC LIMIT 1",
+                (sku,),
+            )
+            prev_row = cur.fetchone()
+            prev_batch_id = prev_row[0] if prev_row else None
+            prev_qty = {}
+            if prev_batch_id:
+                cur.execute(
+                    f"SELECT store_number, qty FROM lcbo_live_snapshots "
+                    f"WHERE sku={ph} AND batch_id={ph}",
+                    (sku, prev_batch_id),
+                )
+                prev_qty = {int(r[0]): (r[1] or 0) for r in cur.fetchall()}
+
+            # APPEND the new snapshot rows.
+            new_qty = {}
+            for r in rows:
+                try:
+                    sn = int(r['store_number'])
+                except (TypeError, ValueError):
+                    continue
+                q = int(r.get('quantity') or 0)
+                if sn in new_qty:
+                    # Belt-and-braces for the spec invariant: one snapshot
+                    # row per (sku, store) per batch, whatever the feed.
+                    continue
+                new_qty[sn] = q
+                cur.execute(
+                    f"INSERT INTO lcbo_live_snapshots "
+                    f"(sku, store_number, qty, store_name, city, batch_id) "
+                    f"VALUES ({ph},{ph},{ph},{ph},{ph},{ph})",
+                    (sku, sn, q, r.get('store_name', ''), r.get('city', ''), batch_id),
+                )
+                row_count += 1
+                store_set.add(sn)
+
+            # Listing events vs previous batch (skip on the very first batch —
+            # there is no baseline to diff against).
+            if prev_batch_id:
+                events = []
+                for sn, q in new_qty.items():
+                    old = prev_qty.get(sn)
+                    if old is None:
+                        events.append((sku, sn, 'LIVE_NEW_LISTING', None, q))
+                    elif q > old:
+                        events.append((sku, sn, 'LIVE_RESTOCK', old, q))
+                for sn, old in prev_qty.items():
+                    if sn not in new_qty:
+                        events.append((sku, sn, 'LIVE_DELISTED', old, None))
+                for e_sku, sn, etype, oq, nq in events:
+                    cur.execute(
+                        f"INSERT INTO live_listing_events "
+                        f"(sku, store_number, event_type, old_qty, new_qty, "
+                        f" batch_id, prev_batch_id, event_date) "
+                        f"VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph}) "
+                        f"ON CONFLICT (sku, store_number, event_type, batch_id) DO NOTHING",
+                        (e_sku, sn, etype, oq, nq, batch_id, prev_batch_id, today_str),
+                    )
+                    events_created += 1
+
+        status = 'ok' if not errors else ('error' if not per_sku_rows else 'partial')
+        cur.execute(
+            f"UPDATE lcbo_live_batches SET finished_at=CURRENT_TIMESTAMP, "
+            f"row_count={ph}, store_count={ph}, status={ph}, error={ph} "
+            f"WHERE batch_id={ph}",
+            (row_count, len(store_set), status, '; '.join(errors), batch_id),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        conn = None
+
+        # Feed the legacy reconciler (inventory_history trend rows,
+        # LCBO_LIVE_ONLY drift discoveries, store auto-onboard) with the rows
+        # we already have — one scrape per cycle serves both engines.
+        if per_sku_rows:
+            try:
+                _lcbo_daily_scrape_worker(per_sku_rows=per_sku_rows)
+            except Exception as e:
+                print(f'[LIVE] legacy reconciler pass failed (non-fatal): {e}')
+
+        summary = {
+            'status': status,
+            'batch_id': batch_id,
+            'triggered_by': triggered_by,
+            'skus': skus,
+            'row_count': row_count,
+            'store_count': len(store_set),
+            'events_created': events_created,
+            'errors': errors,
+        }
+        print(f"[LIVE] batch {batch_id} {status}: {row_count} rows / "
+              f"{len(store_set)} stores / {events_created} events"
+              + (f" / errors: {errors}" if errors else ''))
+        return summary
+    except Exception as e:
+        # Record the failure on the batch row; snapshots are untouched.
+        try:
+            if conn is None:
+                conn = _sod_get_conn()
+            cur = conn.cursor()
+            ph = _sod_ph()
+            cur.execute(
+                f"UPDATE lcbo_live_batches SET finished_at=CURRENT_TIMESTAMP, "
+                f"status='error', error={ph} WHERE batch_id={ph}",
+                (str(e)[:500], batch_id),
+            )
+            conn.commit()
+            cur.close()
+        except Exception as e2:
+            print(f'[LIVE] could not record batch failure: {e2}')
+        print(f'[LIVE] batch {batch_id} failed: {e}')
+        return {'status': 'error', 'batch_id': batch_id, 'error': str(e)}
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        _live_batch_lock.release()
+
+
+# ---------------------------------------------------------------------------
+# Shared lookup helpers (live latest / reconcile)
+# ---------------------------------------------------------------------------
+
+def _sod_latest_presence(skus=None):
+    """Latest SOD snapshot per SKU → {sku: {'latest_date', 'stores': {n: {...}}}}."""
+    out = {}
+    for sku in (skus or list(SOD_TRACKED_SKUS.keys())):
+        latest = db_fetchone(
+            "SELECT CAST(MAX(snapshot_date) AS TEXT) AS d FROM sod_inventory WHERE sku=?",
+            (sku,),
+        )
+        d = row_to_dict(latest)['d'] if latest else None
+        stores = {}
+        if d:
+            for r in db_fetchall(
+                "SELECT store_number, status, on_hand, "
+                "CAST(snapshot_date AS TEXT) AS snapshot_date "
+                "FROM sod_inventory WHERE sku=? AND snapshot_date=?",
+                (sku, d),
+            ):
+                rd = row_to_dict(r)
+                stores[int(rd['store_number'])] = {
+                    'status': rd['status'],
+                    'on_hand': rd['on_hand'] if rd['on_hand'] is not None else 0,
+                    'snapshot_date': rd['snapshot_date'],
+                }
+        out[sku] = {'latest_date': d, 'stores': stores}
+    return out
+
+
+def _live_latest_per_store(sku):
+    """Latest live batch for one SKU → ({store: {...}}, batch_id, checked_at)."""
+    b = db_fetchone(
+        "SELECT batch_id FROM lcbo_live_snapshots WHERE sku=? ORDER BY id DESC LIMIT 1",
+        (sku,),
+    )
+    if not b:
+        return {}, None, None
+    batch_id = row_to_dict(b)['batch_id']
+    out = {}
+    checked_at = None
+    for r in db_fetchall(
+        "SELECT store_number, qty, store_name, city, checked_at "
+        "FROM lcbo_live_snapshots WHERE sku=? AND batch_id=?",
+        (sku, batch_id),
+    ):
+        d = row_to_dict(r)
+        ca = d['checked_at']
+        ca = ca.isoformat() if isinstance(ca, datetime) else (str(ca) if ca else None)
+        out[int(d['store_number'])] = {
+            'qty': d['qty'] if d['qty'] is not None else 0,
+            'checked_at': ca,
+            'store_name': d['store_name'] or '',
+            'city': d['city'] or '',
+        }
+        checked_at = ca
+    return out, batch_id, checked_at
+
+
+def _reconcile_flag(sod_qty, live_qty, rep_units, rep_on_shelf):
+    """Single flag per (sku, store).
+
+    All raw values + the delta ride along in the row, so a flag never hides
+    a diff; it names the loudest one. A source showing 0 and a source with
+    no row are treated as agreeing (lcbo.com only lists stores with stock).
+    The rep_* arguments are kept for the 3-way upgrade path; this fork logs
+    per-SKU visit OUTCOMES (activity_sku_outcomes: outcome + facings), not
+    unit counts, so the rep side is always None today and REP_MISMATCH
+    cannot fire until rep unit counts exist in the schema.
+    """
+    effective_rep = rep_units
+    if effective_rep is None and rep_on_shelf is False:
+        effective_rep = 0
+    if sod_qty is None and live_qty is None:
+        if effective_rep is not None and effective_rep >= 3:
+            return 'REP_MISMATCH'
+        return 'MATCH'
+    if sod_qty is None:
+        return 'MATCH' if (live_qty or 0) == 0 else 'MISSING_FROM_SOD'
+    if live_qty is None:
+        return 'MATCH' if (sod_qty or 0) == 0 else 'MISSING_FROM_LIVE'
+    if effective_rep is not None and abs(effective_rep - live_qty) >= 3:
+        return 'REP_MISMATCH'
+    if sod_qty == live_qty:
+        return 'MATCH'
+    if sod_qty < live_qty:
+        return 'SOD_LAGS_LIVE'
+    return 'LIVE_LAGS_SOD'
+
+
+def _safe_int_arg(name, default):
+    try:
+        return int(request.args.get(name, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+# ---------------------------------------------------------------------------
+# LIVE LCBO.COM engine endpoints
+# ---------------------------------------------------------------------------
+
+@app.route('/api/live/refresh', methods=['POST'])
+def api_live_refresh():
+    """On-demand live scrape batch (all tracked SKUs). Admin token, app origin,
+    or the SOD_CRON_TOKEN bearer (external cron safety net) may trigger it."""
+    provided = (request.args.get('token') or '').strip()
+    if not provided:
+        auth = request.headers.get('Authorization', '')
+        if auth.startswith('Bearer '):
+            provided = auth[7:].strip()
+    cron_ok = bool(SOD_CRON_TOKEN) and provided == SOD_CRON_TOKEN
+    if not (_admin_token_ok() or _request_origin_ok() or cron_ok):
+        return jsonify({'error': 'forbidden',
+                        'detail': 'Admin token, app origin, or cron bearer required.'}), 403
+    summary = run_live_batch(triggered_by='cron' if cron_ok else 'manual')
+    _log_event('live_refresh', 'live_batch', summary.get('batch_id'),
+               'cron' if cron_ok else 'manual', summary)
+    if summary.get('status') == 'already_running':
+        return jsonify(summary), 202
+    if summary.get('status') == 'error':
+        return jsonify(summary), 502
+    return jsonify(summary)
+
+
+@app.route('/api/live/latest', methods=['GET'])
+@cached_response(ttl_seconds=60, key_args=('sku',))
+def api_live_latest():
+    """Latest live batch per store. ?sku= narrows to one SKU (any spelling)."""
+    _ensure_live_tables(get_db())
+    sku_arg = (request.args.get('sku') or '').strip()
+    skus = [_pad_sku(sku_arg)] if sku_arg else sorted(SOD_TRACKED_SKUS.keys())
+    out = {}
+    for sku in skus:
+        stores, batch_id, checked_at = _live_latest_per_store(sku)
+        brand, pname = SOD_TRACKED_SKUS.get(sku, ('', ''))
+        out[sku] = {
+            'brand': brand,
+            'product_name': pname,
+            'batch_id': batch_id,
+            'checked_at': checked_at,
+            'store_count': len(stores),
+            'total_units': sum(s['qty'] for s in stores.values()),
+            'stores': [
+                dict(store_number=sn, **stores[sn]) for sn in sorted(stores)
+            ],
+        }
+    return jsonify({'skus': out})
+
+
+@app.route('/api/live/store/<int:store_number>', methods=['GET'])
+@cached_response(ttl_seconds=60, key_args=('sku', 'days'))
+def api_live_store_series(store_number):
+    """Time series of live snapshots for one store. ?sku= and ?days= (default 30)."""
+    _ensure_live_tables(get_db())
+    days = _safe_int_arg('days', 30)
+    sku_arg = (request.args.get('sku') or '').strip()
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+    if sku_arg:
+        rows = db_fetchall(
+            "SELECT sku, qty, checked_at, batch_id FROM lcbo_live_snapshots "
+            "WHERE store_number=? AND sku=? AND checked_at >= ? "
+            "ORDER BY checked_at ASC, id ASC",
+            (store_number, _pad_sku(sku_arg), cutoff),
+        )
+    else:
+        rows = db_fetchall(
+            "SELECT sku, qty, checked_at, batch_id FROM lcbo_live_snapshots "
+            "WHERE store_number=? AND checked_at >= ? "
+            "ORDER BY checked_at ASC, id ASC",
+            (store_number, cutoff),
+        )
+    series = []
+    for r in rows:
+        d = row_to_dict(r)
+        ca = d['checked_at']
+        d['checked_at'] = ca.isoformat() if isinstance(ca, datetime) else str(ca)
+        d['brand'] = SOD_TRACKED_SKUS.get(d['sku'], ('', ''))[0]
+        series.append(d)
+    return jsonify({'store_number': store_number, 'days': days,
+                    'count': len(series), 'series': series})
+
+
+# ---------------------------------------------------------------------------
+# RECONCILIATION: SOD vs lcbo.com (2-way on this fork)
+# ---------------------------------------------------------------------------
+
+@app.route('/api/reconcile', methods=['GET'])
+@cached_response(ttl_seconds=120, key_args=('days', 'sku'))
+def api_reconcile():
+    """Per (sku, store): latest SOD on-hand vs latest lcbo.com qty, with the
+    delta and ONE of five flags: MATCH | SOD_LAGS_LIVE | LIVE_LAGS_SOD |
+    MISSING_FROM_SOD | MISSING_FROM_LIVE.
+
+    2-WAY on this fork: rep visits land in activities/activity_sku_outcomes
+    (outcome + facings), which record shelf PRESENCE, not unit counts, so the
+    rep_* columns ship null and REP_MISMATCH cannot fire. The response shape
+    matches the Dripp 3-way contract so the frontend and a future rep-count
+    field slot straight in.
+
+    The store universe per SKU is the union of stores in the latest SOD
+    snapshot and the latest live batch (this fork has no territory book).
+    Store name/city are enriched from the master `stores` directory.
+    All raw values + last-checked timestamps for every source ride on each
+    row — a diff is never hidden.
+    """
+    _ensure_live_tables(get_db())
+    days = _safe_int_arg('days', 7)
+    sku_arg = (request.args.get('sku') or '').strip()
+    skus = [_pad_sku(sku_arg)] if sku_arg else sorted(SOD_TRACKED_SKUS.keys())
+
+    directory = {}
+    for r in db_fetchall("SELECT store_number, account, city FROM stores"):
+        d = row_to_dict(r)
+        directory[int(d['store_number'])] = d
+
+    rows_out = []
+    sources = {}
+    for sku in skus:
+        brand, pname = SOD_TRACKED_SKUS.get(sku, ('', ''))
+        sod = _sod_latest_presence([sku])[sku]
+        live, live_batch_id, live_checked_at = _live_latest_per_store(sku)
+        sources[sku] = {
+            'sod_latest_snapshot': sod['latest_date'],
+            'live_batch_id': live_batch_id,
+            'live_checked_at': live_checked_at,
+            'rep_observation_window_days': days,
+        }
+        for sn in sorted(set(sod['stores']) | set(live)):
+            s = sod['stores'].get(sn)
+            l = live.get(sn)
+            sod_qty = s['on_hand'] if s else None
+            live_qty = l['qty'] if l else None
+            flag = _reconcile_flag(sod_qty, live_qty, None, None)
+            dinfo = directory.get(sn) or {}
+            rows_out.append({
+                'sku': sku,
+                'brand': brand,
+                'product_name': pname,
+                'store_number': sn,
+                'account': dinfo.get('account') or (l['store_name'] if l else '') or '',
+                'city': dinfo.get('city') or (l['city'] if l else '') or '',
+                'sod_on_hand': sod_qty,
+                'sod_status': s['status'] if s else None,
+                'sod_snapshot_date': s['snapshot_date'] if s else None,
+                'live_qty': live_qty,
+                'live_checked_at': l['checked_at'] if l else None,
+                'rep_units': None,
+                'rep_on_shelf': None,
+                'rep_observed_at': None,
+                'rep': None,
+                'delta_sod_live': (sod_qty - live_qty)
+                    if (sod_qty is not None and live_qty is not None) else None,
+                'delta_rep_live': None,
+                'flag': flag,
+            })
+    summary = {}
+    for r in rows_out:
+        summary[r['flag']] = summary.get(r['flag'], 0) + 1
+    rows_out.sort(key=lambda r: (r['flag'] == 'MATCH', r['sku'], r['store_number']))
+    return jsonify({'days': days, 'mode': '2-way (SOD vs lcbo.com; rep counts not in schema)',
+                    'rows': rows_out, 'summary': summary, 'sources': sources})
+
+
+# ---------------------------------------------------------------------------
+# LIVE engine scheduler — hourly 08:00-21:00 America/Toronto
+# ---------------------------------------------------------------------------
+
+_live_scheduler = None
+
+
+def start_live_scheduler():
+    """Start the live lcbo.com engine: run_live_batch HOURLY, 08:00-21:00 ET.
+
+    LCBO.com data does not move faster than this — per-second polling is not
+    real and would get the IP blocked. This cadence plus the on-demand
+    POST /api/live/refresh IS the honest "live". Each batch appends to
+    lcbo_live_snapshots, detects live_listing_events, and feeds the legacy
+    reconciler (LCBO_LIVE_ONLY drift + store auto-onboard) with the same rows.
+    """
+    global _live_scheduler
+    if _live_scheduler is not None:
+        return
+    if os.environ.get('PYTEST_CURRENT_TEST') or os.environ.get('DISABLE_SCHEDULERS'):
+        print('[LIVE] scheduler NOT started (test run / DISABLE_SCHEDULERS)')
+        return
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+    except ImportError:
+        print('[LIVE] apscheduler not installed — skipping')
+        return
+    try:
+        try:
+            sched = BackgroundScheduler(timezone='America/Toronto')
+        except Exception:
+            sched = BackgroundScheduler()
+        # Hourly on the hour between 08:00 and 21:00 ET (14 runs/day) — the
+        # store-hours window where inventory actually moves. 9 SKUs per batch,
+        # LIVE_SCRAPE_GAP_SECONDS apart, is polite to lcbo.com.
+        sched.add_job(
+            lambda: run_live_batch(triggered_by='scheduler'),
+            CronTrigger(hour='8-21', minute=0),
+            id='live_hourly_batch',
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800 * 2,
+        )
+        sched.start()
+        _live_scheduler = sched
+        next_run = sched.get_job('live_hourly_batch').next_run_time
+        print(f'[LIVE] scheduler started — hourly 08:00-21:00 ET (next: {next_run})')
+    except Exception as e:
+        print(f'[LIVE] scheduler failed: {e}')
+
+
+start_live_scheduler()
 
 
 if __name__ == '__main__':
