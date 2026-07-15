@@ -8010,9 +8010,10 @@ def api_horeca_prospects():
     """The target universe, ranked the way the agency sells: unmatched
     independents in the core first, then GTHA, then the rest. Every row gets
     Google Maps + Yelp deep links (free, no API keys). Filters: q, city,
-    region (core|gtha|other), kind, independent=1, unmatched=1."""
+    region (core|gtha|other), kind, independent=1, unmatched=1, has_phone=1."""
     db = get_db()
     _ensure_horeca_v2(db)
+    _ensure_gtha_sweep(db)  # guarantees the enrichment columns exist
     ph = '%s' if USE_POSTGRES else '?'
     where, params = ['1=1'], []
     q = (request.args.get('q') or '').strip()
