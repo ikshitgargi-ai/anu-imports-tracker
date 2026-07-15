@@ -158,6 +158,31 @@ class TestEnrich:
         vf = next(x for x in p['rows'] if 'VELVET' in x['name'])
         assert vf['phone'] == '+1-416-999-0000'  # preserved
 
+    def test_enrich_stamps_field_book_account(self, swept, client, app_module):
+        # Regression: a field-book (horeca_accounts) row that matches a
+        # harvested venue by name+city must enrich WITHOUT the endpoint
+        # 500-ing. The venue-lookup tuple carries 8 fields (osm addr added
+        # later); the book loop once unpacked only 7 and raised ValueError in
+        # production. No test seeded horeca_accounts, so it slipped past.
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            ph = '%s' if app_module.USE_POSTGRES else '?'
+            db.execute(
+                f"INSERT INTO horeca_accounts (name, city) VALUES ({ph},{ph})",
+                ('The Velvet Fox', 'Toronto'))
+            db.commit()
+        try:
+            r = client.post('/api/horeca/enrich', json={})
+            assert r.status_code == 200, r.get_json()
+            assert r.get_json()['book_accounts_enriched'] >= 1  # coords stamped
+        finally:
+            with app_module.app.app_context():
+                db = app_module.get_db()
+                ph = '%s' if app_module.USE_POSTGRES else '?'
+                db.execute(f"DELETE FROM horeca_accounts WHERE name={ph}",
+                           ('The Velvet Fox',))
+                db.commit()
+
 
 class TestVenues:
     def test_has_phone_filter(self, swept, client):

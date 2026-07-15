@@ -8479,7 +8479,7 @@ def api_horeca_enrich():
         hit = by_key.get((_horeca_norm_name(name), (city or '').strip().lower()))
         if not hit:
             continue
-        _, osm_id, ophone, owebsite, olat, olng, ocuisine = hit
+        _, osm_id, ophone, owebsite, olat, olng, ocuisine, oaddr = hit
         np, nlat, nlng = phone or ophone, lat or olat, lng or olng
         if (np, nlat, nlng) == (phone, lat, lng):
             continue

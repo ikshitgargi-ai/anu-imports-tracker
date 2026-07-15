@@ -6,7 +6,7 @@ services:
     buildCommand: pip install -r requirements.txt
     # Long timeout for the Daily A SOD sync (1.5M rows can take ~22 min)
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 1800 --workers 1
-    plan: free  # free tier (no card needed). ~50s cold start after idle. Upgrade to 'starter' ($7/mo) anytime for always-on — one click in the Render dashboard.
+    plan: starter  # always-on ($7/mo). Founder approved 2026-07-14 so the in-process GTHA sweep drainer runs to completion. Free tier slept the dyno mid-sweep and froze the drainer thread. Confirm the plan change once in the Render dashboard.
     healthCheckPath: /healthz
     # ENV VALUES: copy the CURRENT values from the lcbo-tracker Render service
     # (same SOD account) — EXCEPT DATABASE_URL, which must be a NEW separate
