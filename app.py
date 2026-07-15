@@ -4134,10 +4134,17 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
             for store, new_st in current_per_store.items():
                 old_st = prior_per_store.get(store)
                 if old_st is None:
-                    # Store newly carrying this SKU
-                    store_change_inserts.append(
-                        (tracked_sku, store, snapshot_date, None, new_st, 'NEW_LISTING'),
-                    )
+                    # Store newly carrying this SKU. Only status 'L' is a real
+                    # listing; a first appearance already delisted ('D'/'F')
+                    # must NOT fold as LISTED into the canonical ledger.
+                    if new_st == 'L':
+                        store_change_inserts.append(
+                            (tracked_sku, store, snapshot_date, None, new_st, 'NEW_LISTING'),
+                        )
+                    else:
+                        store_change_inserts.append(
+                            (tracked_sku, store, snapshot_date, None, new_st, 'DELISTED'),
+                        )
                 elif old_st != new_st:
                     if new_st == 'L' and old_st in ('D', 'F'):
                         store_change_inserts.append(
