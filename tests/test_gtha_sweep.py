@@ -223,3 +223,27 @@ class TestTorontoBytesPath:
             content_type='multipart/form-data')
         assert r.status_code == 200, r.get_json()
         assert r.get_json()['food_licences_with_phone'] == 1
+
+
+class TestStandaloneDrain:
+    def test_drain_standalone_processes_pending(self, app_module):
+        # The scheduler path: dedicated connection, cursor-only writes (the
+        # bug class that broke Postgres). Mock Overpass, drain, assert venues.
+        one = [{'type': 'node', 'id': 99, 'lat': 43.7, 'lon': -79.4,
+                'tags': {'amenity': 'bar', 'name': 'Drain Test Bar',
+                         'addr:city': 'Toronto', 'phone': '416-000-0000'}}]
+        calls = {'n': 0}
+        def fake(bbox):
+            calls['n'] += 1
+            return (list(one), '') if calls['n'] == 1 else ([], '')
+        app_module._overpass_sweep_tile = fake
+        app_module.time.sleep = lambda *a, **k: None
+        with app_module.app.app_context():
+            app_module.get_db()  # ensure grid + tables exist
+            app_module.api_horeca_sweep_plan  # noqa
+        client = app_module.app.test_client()
+        client.post('/api/horeca/sweep/plan', json={})
+        n = app_module._sweep_drain_standalone(2)
+        assert n == 2
+        v = client.get('/api/horeca/venues?q=drain%20test').get_json()
+        assert any(r['name'] == 'Drain Test Bar' for r in v['rows'])

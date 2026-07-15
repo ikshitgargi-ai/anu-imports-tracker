@@ -8215,6 +8215,99 @@ def _overpass_sweep_tile(bbox):
     return [], 'exhausted retries'
 
 
+def _sweep_upsert_venue(cur, v, opening_hours, region):
+    """Upsert one OSM venue on a RAW cursor (works from a request or a
+    scheduler thread; get_db() returns a bare psycopg2 conn with no .execute,
+    so all writes go through a cursor)."""
+    if USE_POSTGRES:
+        cur.execute(
+            "INSERT INTO osm_venues (osm_id, name, kind, address, city, "
+            "postal, lat, lng, phone, website, cuisine, opening_hours, "
+            "region, last_seen) VALUES "
+            "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,CURRENT_TIMESTAMP) "
+            "ON CONFLICT (osm_id) DO UPDATE SET name=excluded.name, "
+            "kind=excluded.kind, address=excluded.address, "
+            "city=excluded.city, postal=excluded.postal, lat=excluded.lat, "
+            "lng=excluded.lng, phone=excluded.phone, website=excluded.website, "
+            "cuisine=excluded.cuisine, region=excluded.region, "
+            "last_seen=CURRENT_TIMESTAMP",
+            (v['osm_id'], v['name'], v['account_type'], v['address'],
+             v['city'], v['postal'], v['lat'], v['lng'], v['phone'],
+             v['website'], v['cuisine'], opening_hours, region))
+    else:
+        cur.execute(
+            "INSERT OR REPLACE INTO osm_venues (osm_id, name, kind, address, "
+            "city, postal, lat, lng, phone, website, cuisine, opening_hours, "
+            "region, last_seen) VALUES "
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+            (v['osm_id'], v['name'], v['account_type'], v['address'],
+             v['city'], v['postal'], v['lat'], v['lng'], v['phone'],
+             v['website'], v['cuisine'], opening_hours, region))
+
+
+def _sweep_process_one_tile(conn, key, s, w, n, e):
+    """Overpass one tile → upsert venues → mark the tile. Returns (status,
+    count). All writes via a cursor so it is Postgres-safe from any thread."""
+    ph = '%s' if USE_POSTGRES else '?'
+    elements, err = _overpass_sweep_tile((s, w, n, e))
+    cur = conn.cursor()
+    if err:
+        cur.execute(
+            f"UPDATE osm_sweep_tiles SET status='error', error={ph}, "
+            f"swept_at=CURRENT_TIMESTAMP WHERE tile_key={ph}", (err[:200], key))
+        conn.commit()
+        cur.close()
+        return ('error', 0)
+    cnt = 0
+    for el in elements:
+        v = _normalize_overpass_element(el)
+        if not v or not v.get('osm_id'):
+            continue
+        _sweep_upsert_venue(cur, v, (el.get('tags') or {}).get('opening_hours', ''),
+                            _horeca_region(v['city']))
+        cnt += 1
+    cur.execute(
+        f"UPDATE osm_sweep_tiles SET status='done', venue_count={ph}, "
+        f"error='', swept_at=CURRENT_TIMESTAMP WHERE tile_key={ph}", (cnt, key))
+    conn.commit()
+    cur.close()
+    return ('done', cnt)
+
+
+def _sweep_drain_standalone(n_tiles=6):
+    """Drain N pending tiles on a DEDICATED connection — for the scheduler
+    thread, which has no Flask request context and must never touch g.db.
+    Immune to the HTTP proxy timeout (the reason the browser/curl drain
+    stalls on dense downtown tiles)."""
+    conn = None
+    try:
+        conn = _sod_get_conn()
+        _ensure_gtha_sweep(conn)
+        ph = '%s' if USE_POSTGRES else '?'
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT tile_key, south, west, north, east FROM osm_sweep_tiles "
+            f"WHERE status IN ('pending','error') ORDER BY status DESC, "
+            f"tile_key LIMIT {ph}", (n_tiles,))
+        pend = cur.fetchall()
+        cur.close()
+        if not pend:
+            return 0
+        for row in pend:
+            _sweep_process_one_tile(conn, row[0], row[1], row[2], row[3], row[4])
+            time.sleep(2)
+        return len(pend)
+    except Exception as ex:
+        print(f'[SWEEP] drain error (self-heals next tick): {ex}')
+        return 0
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 @app.route('/api/horeca/sweep/plan', methods=['POST'])
 @require_app_origin
 def api_horeca_sweep_plan():
@@ -8256,59 +8349,12 @@ def api_horeca_sweep_run():
         f"SELECT tile_key, south, west, north, east FROM osm_sweep_tiles "
         f"WHERE status IN ('pending','error') ORDER BY status DESC, tile_key "
         f"LIMIT {n_tiles}")
-    swept = venues_new = venues_seen = 0
+    swept = venues_seen = 0
     for key, s, w, n, e in pend:
-        elements, err = _overpass_sweep_tile((s, w, n, e))
-        if err:
-            db.execute(
-                f"UPDATE osm_sweep_tiles SET status='error', error={ph}, "
-                f"swept_at=CURRENT_TIMESTAMP WHERE tile_key={ph}", (err, key))
-            db.commit()
-            continue
-        cnt = 0
-        cur = db.cursor() if USE_POSTGRES else db
-        for el in elements:
-            v = _normalize_overpass_element(el)
-            if not v or not v.get('osm_id'):
-                continue
-            region = _horeca_region(v['city'])
-            if USE_POSTGRES:
-                cur.execute(
-                    "INSERT INTO osm_venues (osm_id, name, kind, address, city, "
-                    "postal, lat, lng, phone, website, cuisine, opening_hours, "
-                    "region, last_seen) VALUES "
-                    "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,CURRENT_TIMESTAMP) "
-                    "ON CONFLICT (osm_id) DO UPDATE SET name=excluded.name, "
-                    "kind=excluded.kind, address=excluded.address, "
-                    "city=excluded.city, postal=excluded.postal, "
-                    "lat=excluded.lat, lng=excluded.lng, phone=excluded.phone, "
-                    "website=excluded.website, cuisine=excluded.cuisine, "
-                    "region=excluded.region, last_seen=CURRENT_TIMESTAMP",
-                    (v['osm_id'], v['name'], v['account_type'], v['address'],
-                     v['city'], v['postal'], v['lat'], v['lng'], v['phone'],
-                     v['website'], v['cuisine'],
-                     (el.get('tags') or {}).get('opening_hours', ''), region))
-            else:
-                cur.execute(
-                    "INSERT OR REPLACE INTO osm_venues (osm_id, name, kind, "
-                    "address, city, postal, lat, lng, phone, website, cuisine, "
-                    "opening_hours, region, last_seen) VALUES "
-                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
-                    (v['osm_id'], v['name'], v['account_type'], v['address'],
-                     v['city'], v['postal'], v['lat'], v['lng'], v['phone'],
-                     v['website'], v['cuisine'],
-                     (el.get('tags') or {}).get('opening_hours', ''), region))
-            cnt += 1
-        db.commit()
-        if USE_POSTGRES:
-            cur.close()
-        db.execute(
-            f"UPDATE osm_sweep_tiles SET status='done', venue_count={ph}, "
-            f"error='', swept_at=CURRENT_TIMESTAMP WHERE tile_key={ph}",
-            (cnt, key))
-        db.commit()
-        swept += 1
-        venues_seen += cnt
+        st, cnt = _sweep_process_one_tile(db, key, s, w, n, e)
+        if st == 'done':
+            swept += 1
+            venues_seen += cnt
         time.sleep(2)  # Overpass etiquette between tiles
     prog = db_fetchall(
         "SELECT status, COUNT(*) FROM osm_sweep_tiles GROUP BY status")
@@ -25658,6 +25704,51 @@ def start_live_scheduler():
 
 
 start_live_scheduler()
+
+
+_sweep_scheduler = None
+
+
+def start_sweep_scheduler():
+    """Drain the GTHA sweep grid in-process, 6 tiles every 3 minutes, until it
+    is fully swept (then a cheap no-op). Runs in a scheduler thread on a
+    dedicated connection, so no HTTP request ever blocks and Overpass is
+    polled politely. This completes the sweep hands-off — the browser button
+    is only for an on-demand kick."""
+    global _sweep_scheduler
+    if _sweep_scheduler is not None:
+        return
+    if os.environ.get('PYTEST_CURRENT_TEST') or os.environ.get('DISABLE_SCHEDULERS'):
+        print('[SWEEP] scheduler NOT started (test run / DISABLE_SCHEDULERS)')
+        return
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.interval import IntervalTrigger
+    except ImportError:
+        print('[SWEEP] apscheduler not installed — skipping')
+        return
+    try:
+        try:
+            sched = BackgroundScheduler(timezone='America/Toronto')
+        except Exception:
+            sched = BackgroundScheduler()
+        sched.add_job(
+            lambda: _sweep_drain_standalone(6),
+            IntervalTrigger(minutes=3),
+            id='gtha_sweep_drain',
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=600,
+        )
+        sched.start()
+        _sweep_scheduler = sched
+        print('[SWEEP] drainer scheduled — 6 tiles every 3 min until complete')
+    except Exception as e:
+        print(f'[SWEEP] scheduler failed to start: {e}')
+
+
+start_sweep_scheduler()
 
 
 if __name__ == '__main__':
