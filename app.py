@@ -8478,7 +8478,13 @@ def api_horeca_enrich_toronto_phones():
 
     def _consume(line_iter):
         nonlocal scanned, kept
-        reader = csv.reader(line_iter)
+        # requests' iter_lines yields BYTES (decode_unicode is unreliable across
+        # versions); csv.reader needs str. Decode defensively so both the live
+        # stream and an uploaded/text source work.
+        def _as_str(it):
+            for ln in it:
+                yield ln.decode('utf-8', 'ignore') if isinstance(ln, (bytes, bytearray)) else ln
+        reader = csv.reader(_as_str(line_iter))
         header = None
         for row in reader:
             if header is None:
@@ -24401,6 +24407,38 @@ def run_live_batch(triggered_by='scheduler'):
         _ensure_listing_ledger(conn)
         cur = conn.cursor()
         ph = _sod_ph()
+        # Reconcile prior orphans FIRST. A batch that never set finished_at is
+        # one the platform recycled mid-run (free-tier idle spindown, or a
+        # health-check restart while the single gunicorn worker was busy
+        # scraping). We already hold _live_batch_lock, so no batch is running in
+        # THIS process; any 'running' row older than the cutoff belongs to a dead
+        # process. Mark it 'orphaned' so the observability window is honest.
+        # This is operational metadata (never the immutable listing_ledger), so
+        # updating it is allowed and non-destructive — the row is kept, not deleted.
+        try:
+            if USE_POSTGRES:
+                cur.execute(
+                    "UPDATE lcbo_live_batches SET status='orphaned', "
+                    "finished_at=NOW(), "
+                    "error='orphaned: instance recycled before completion "
+                    "(no finished_at)' "
+                    "WHERE status='running' AND finished_at IS NULL "
+                    "AND started_at < NOW() - INTERVAL '15 minutes'")
+            else:
+                cur.execute(
+                    "UPDATE lcbo_live_batches SET status='orphaned', "
+                    "finished_at=CURRENT_TIMESTAMP, "
+                    "error='orphaned: instance recycled before completion "
+                    "(no finished_at)' "
+                    "WHERE status='running' AND finished_at IS NULL "
+                    "AND started_at < datetime('now','-15 minutes')")
+            conn.commit()
+        except Exception as _oe:
+            print(f'[LIVE] orphan sweep skipped (non-fatal): {_oe}')
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         cur.execute(
             f"INSERT INTO lcbo_live_batches (batch_id, triggered_by, skus, status) "
             f"VALUES ({ph},{ph},{ph},'running')",
@@ -24520,6 +24558,31 @@ def run_live_batch(triggered_by='scheduler'):
                         pass
                 errors.append(f"ledger fold skipped for {sku}: {_le}")
                 print(f"[LIVE] listing_ledger fold skipped for {sku} (non-fatal): {_le}")
+
+            # DURABILITY: commit each SKU the moment it lands — this is the
+            # "first SKU commit" the batch was missing. run_live_batch runs on a
+            # single gunicorn worker (--workers 1) and the free tier recycles the
+            # instance mid-batch (idle spindown, or a health-check restart while
+            # this worker is busy scraping). With a single end-of-batch commit, a
+            # recycle lost EVERY snapshot and EVERY 'live' ledger fold and left the
+            # batch orphaned 'running' with 0 rows — which is exactly why the live
+            # source stayed empty while SOD folded fine. Committing per SKU makes
+            # each SKU's writes durable immediately: a recycle now loses at most
+            # the in-flight SKU, and every completed SKU's 'live' ledger rows
+            # persist. Same proven pattern as the AGCO per-chunk commit (2bd05c8).
+            try:
+                cur.execute(
+                    f"UPDATE lcbo_live_batches SET row_count={ph}, "
+                    f"store_count={ph} WHERE batch_id={ph}",
+                    (row_count, len(store_set), batch_id),
+                )
+                conn.commit()
+            except Exception as _ce:
+                print(f'[LIVE] per-SKU commit failed for {sku} (non-fatal): {_ce}')
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
 
         status = 'ok' if not errors else ('error' if not per_sku_rows else 'partial')
         cur.execute(

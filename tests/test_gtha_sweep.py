@@ -207,3 +207,19 @@ class TestTorontoPhoneEnrich:
         # 3 data rows scanned, only 1 kept (cancelled + dry-cleaner dropped)
         assert b['rows_scanned'] == 3
         assert b['food_licences_with_phone'] == 1
+
+
+
+class TestTorontoBytesPath:
+    def test_bytes_line_source_ok(self, swept, app_module):
+        # Regression: the live stream yields bytes (iter_lines); csv.reader
+        # needs str. Feed bytes lines straight through the internal path.
+        import io as _io
+        client = app_module.app.test_client()
+        raw = TORONTO_BIZ_CSV.encode()
+        r = client.post(
+            '/api/horeca/enrich/toronto-phones',
+            data={'file': (_io.BytesIO(raw), 'biz.csv')},
+            content_type='multipart/form-data')
+        assert r.status_code == 200, r.get_json()
+        assert r.get_json()['food_licences_with_phone'] == 1

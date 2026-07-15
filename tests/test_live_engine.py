@@ -285,3 +285,57 @@ class TestReconcile:
     def test_reconcile_never_500_on_empty_data(self, app_module, client):
         resp = client.get('/api/reconcile?days=abc&sku=9999999&nocache=1')
         assert resp.status_code == 200
+
+
+def test_partial_batch_survives_a_midbatch_kill(app_module, monkeypatch):
+    """A batch torn down mid-loop (free-tier instance recycle: idle spindown, or
+    a health-check restart while the single gunicorn worker is busy scraping)
+    must still leave every COMPLETED SKU's 'live' ledger rows durably committed.
+
+    Regression for the single-end-of-batch-commit bug that left the live source
+    at 0 rows on prod while SOD folded fine: the instance was recycled before the
+    one final commit was ever reached, so every snapshot and ledger fold was lost
+    and the batch was orphaned 'running'. The fix commits each SKU as it lands.
+    """
+    monkeypatch.setattr(app_module, 'LIVE_SCRAPE_GAP_SECONDS', 0)
+
+    # Start from a clean ledger so the count is unambiguous (DELETE in a TEST is
+    # fine — the immutability guard only greps app.py, never the tests).
+    db0 = _db()
+    for t in ('listing_ledger', 'store_listings', 'lcbo_live_snapshots',
+              'lcbo_live_batches', 'live_listing_events'):
+        db0.execute(f"DELETE FROM {t}")
+    db0.commit()
+    db0.close()
+
+    KILL_AFTER = 2  # the first 2 SKUs land; the 3rd scrape "kills" the instance
+    calls = {'n': 0}
+
+    def killer_scraper(sku):
+        calls['n'] += 1
+        if calls['n'] > KILL_AFTER:
+            # SystemExit is NOT caught by run_live_batch's `except Exception`,
+            # so it propagates exactly like a real process teardown.
+            raise SystemExit('simulated instance recycle mid-batch')
+        sn = 100 + calls['n']  # distinct store per SKU → one 'live' RECONFIRMED
+        return ([{'store_number': str(sn), 'city': 'Toronto',
+                  'intersection': 'X', 'store_name': f'S{sn}',
+                  'address': f'{sn} St', 'phone': '', 'quantity': 5}], None)
+
+    monkeypatch.setattr(app_module, '_live_scrape_sku', killer_scraper)
+
+    with pytest.raises(SystemExit):
+        app_module.run_live_batch(triggered_by='test')
+
+    db = _db()
+    live_rows = db.execute(
+        "SELECT COUNT(*) FROM listing_ledger WHERE source='live'").fetchone()[0]
+    live_skus = db.execute(
+        "SELECT COUNT(DISTINCT sku) FROM listing_ledger WHERE source='live'"
+    ).fetchone()[0]
+    db.close()
+
+    # Before the fix this was 0 (nothing committed before the single end-of-batch
+    # commit the kill never reached). After the fix the 2 completed SKUs persist.
+    assert live_rows == KILL_AFTER, f'expected {KILL_AFTER} live rows, got {live_rows}'
+    assert live_skus == KILL_AFTER
