@@ -9124,6 +9124,44 @@ def api_sales_geocode_pipeline():
                     'forward_geocoded': geocoded, 'remaining': remaining})
 
 
+_OFFICIAL_STORE_REPS = ('ikshit', 'vaneet', 'ed', 'namit')
+
+
+@app.route('/api/admin/clean-store-reps', methods=['POST'])
+@require_app_origin
+def api_admin_clean_store_reps():
+    """Keep stores.rep to the official Anu roster only. Stale NB-team names
+    (Wendy Jones, Kimberly Doran, meghan borisko, Montana Marshall, tyler
+    weber, maria spehar, generic 'sales') rode in with the migrated store
+    directory and must not surface as our reps. Normalizes the 'Ikshit Sharma'
+    full-name variant to 'Ikshit' and clears every other non-roster name to
+    unassigned. Idempotent; re-migration-safe."""
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    phs = ','.join([ph] * len(_OFFICIAL_STORE_REPS))
+    if USE_POSTGRES:
+        cur = db.cursor()
+        cur.execute("UPDATE stores SET rep='Ikshit' WHERE TRIM(rep)='Ikshit Sharma'")
+        normalized = cur.rowcount
+        cur.execute(f"UPDATE stores SET rep='' WHERE COALESCE(rep,'')!='' "
+                    f"AND LOWER(TRIM(rep)) NOT IN ({phs})", _OFFICIAL_STORE_REPS)
+        cleared = cur.rowcount
+        db.commit()
+        cur.close()
+    else:
+        c1 = db.execute("UPDATE stores SET rep='Ikshit' WHERE TRIM(rep)='Ikshit Sharma'")
+        normalized = c1.rowcount
+        c2 = db.execute(f"UPDATE stores SET rep='' WHERE COALESCE(rep,'')!='' "
+                        f"AND LOWER(TRIM(rep)) NOT IN ({phs})", _OFFICIAL_STORE_REPS)
+        cleared = c2.rowcount
+        db.commit()
+    remaining = db_fetchall("SELECT DISTINCT rep FROM stores "
+                            "WHERE COALESCE(rep,'')!='' ORDER BY rep")
+    return jsonify({'status': 'ok', 'normalized_ikshit_sharma': normalized,
+                    'cleared_stray': cleared,
+                    'remaining_reps': [r[0] for r in remaining]})
+
+
 @app.route('/api/sales/pipeline', methods=['GET'])
 def api_sales_pipeline():
     """The self-building pipeline board: counts by stage + accounts whose next
