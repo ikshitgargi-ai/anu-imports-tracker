@@ -296,3 +296,12 @@ class TestAddressBackfill:
         v = client.get('/api/horeca/venues?q=unlicensed%20diner').get_json()
         diner = next(x for x in v['rows'] if 'Unlicensed' in x['name'])
         assert '5 REAL ST' in diner['address']
+
+
+class TestBackupCoverage:
+    def test_field_tables_in_backup(self, app_module):
+        names = {t for t, _ in app_module._EXPORT_TABLES}
+        for t in ('activity_sku_outcomes', 'rep_listing_observations',
+                  'tasting_blitz_stores', 'tasting_blitz_log',
+                  'tasting_blitz_photos', 'tasting_blitz_schedule'):
+            assert t in names, f'{t} missing from daily backup'

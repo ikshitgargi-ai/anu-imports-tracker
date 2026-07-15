@@ -9665,6 +9665,14 @@ _EXPORT_TABLES = [
     ('horeca_activities',          'id'),
     ('osm_venues',                 'osm_id'),
     ('osm_sweep_tiles',            'tile_key'),
+    # Field-data tables that were missing from the daily off-site backup —
+    # each holds real rep/tasting data written on Postgres prod.
+    ('activity_sku_outcomes',      'id'),
+    ('rep_listing_observations',   'id'),
+    ('tasting_blitz_stores',       'id'),
+    ('tasting_blitz_log',          'id'),
+    ('tasting_blitz_photos',       'id'),
+    ('tasting_blitz_schedule',     'id'),
     ('lcbo_live_batches',          'id'),
     ('lcbo_live_snapshots',        'id'),
     ('live_listing_events',        'id'),
@@ -9813,19 +9821,22 @@ def api_admin_import():
                     sql = f"INSERT INTO {tname} ({col_list}) VALUES ({placeholders})"
                 for r in rows:
                     vals = tuple(r.get(c) for c in cols)
+                    # SAVEPOINT per row: db.rollback() here would abort the WHOLE
+                    # table's transaction (every good row inserted so far is
+                    # lost). ROLLBACK TO SAVEPOINT undoes ONLY the failing row.
+                    cur.execute("SAVEPOINT sp_import_row")
                     try:
                         cur.execute(sql, vals)
                         if cur.rowcount == 1:
                             ins += 1
                         else:
                             upd += 1
+                        cur.execute("RELEASE SAVEPOINT sp_import_row")
                     except Exception as e:
-                        # roll back this row's transaction so subsequent rows still work
-                        db.rollback()
+                        cur.execute("ROLLBACK TO SAVEPOINT sp_import_row")
                         skip += 1
                         if err is None:
                             err = f"{type(e).__name__}: {str(e)[:200]}"
-                        cur = db.cursor()
                 db.commit()
                 cur.close()
             else:
