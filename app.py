@@ -8442,6 +8442,130 @@ def api_horeca_enrich():
     })
 
 
+# Toronto Municipal Licensing & Standards — Business Licences (Open Government
+# Licence Toronto, storable). The ONE open GTHA dataset carrying a business
+# PHONE at scale — the enrichment OSM lacks. Match key = normalized operating
+# name + postal (per the source scout).
+_TORONTO_BIZ_URL = ('https://ckan0.cf.opendata.inter.prod-toronto.ca/dataset/'
+                    '57b2285f-4f80-45fb-ae3e-41a02c3a137f/resource/'
+                    '54bddc5e-92d9-4102-89c1-43e82f8f4d2d/download/'
+                    'business-licences-data.csv')
+_TORONTO_FOOD_CATS = ('EATING', 'FOOD', 'BAR', 'REFRESHMENT', 'CATER',
+                      'LIQUOR', 'TAVERN', 'HOSPITALITY')
+
+
+def _postal_key(p):
+    return (p or '').replace(' ', '').upper()[:6]
+
+
+@app.route('/api/horeca/enrich/toronto-phones', methods=['POST'])
+@require_app_origin
+def api_horeca_enrich_toronto_phones():
+    """Stream the Toronto Business Licences CSV, keep only CURRENT food/drink
+    licences that carry a phone, and stamp that phone into BLANK phone fields
+    of matching AGCO licensees / book accounts / OSM venues (match on
+    normalized operating name + postal). Memory-safe: iterates lines, never
+    holds the whole file. Accepts a multipart 'file' upload as an offline
+    fallback."""
+    db = get_db()
+    _ensure_gtha_sweep(db)
+    _ensure_horeca_v2(db)
+    ph = '%s' if USE_POSTGRES else '?'
+
+    # Build a compact {(norm_name, postal): phone} map from the CSV.
+    phones = {}
+    scanned = kept = 0
+
+    def _consume(line_iter):
+        nonlocal scanned, kept
+        reader = csv.reader(line_iter)
+        header = None
+        for row in reader:
+            if header is None:
+                header = [h.strip() for h in row]
+                idx = {h: i for i, h in enumerate(header)}
+                continue
+            scanned += 1
+            try:
+                cat = row[idx.get('Category', -1)] if idx.get('Category') is not None else ''
+                cancel = row[idx.get('Cancel Date', -1)] if idx.get('Cancel Date') is not None else ''
+                name = row[idx.get('Operating Name', -1)] if idx.get('Operating Name') is not None else ''
+                phone = row[idx.get('Business Phone', -1)] if idx.get('Business Phone') is not None else ''
+                postal = row[idx.get('Licence Address Line 3', -1)] if idx.get('Licence Address Line 3') is not None else ''
+            except (IndexError, TypeError):
+                continue
+            if cancel.strip():          # cancelled licence — skip
+                continue
+            phone = (phone or '').strip()
+            if not phone:
+                continue
+            catU = (cat or '').upper()
+            if not any(k in catU for k in _TORONTO_FOOD_CATS):
+                continue
+            key = (_horeca_norm_name(name), _postal_key(postal))
+            if key[0] and key[1]:
+                phones[key] = phone   # latest row wins
+                kept += 1
+
+    if 'file' in request.files:
+        text = request.files['file'].read().decode('utf-8-sig', 'ignore')
+        _consume(iter(text.splitlines()))
+    else:
+        if http_requests is None:
+            return jsonify({'error': 'requests unavailable'}), 500
+        try:
+            resp = http_requests.get(_TORONTO_BIZ_URL,
+                                     headers={'User-Agent': _PROSPECT_UA},
+                                     timeout=120, stream=True)
+            resp.raise_for_status()
+            _consume(resp.iter_lines(decode_unicode=True))
+        except Exception as e:
+            return jsonify({'error': f'could not fetch Toronto CSV: {e}'}), 502
+
+    def _stamp(table, id_col, extra_set=''):
+        rows = db_fetchall(
+            f"SELECT {id_col}, name, COALESCE(postal,''), COALESCE(phone,'') "
+            f"FROM {table}")
+        cur = db.cursor() if USE_POSTGRES else db
+        n = 0
+        for rid, name, postal, curphone in rows:
+            if (curphone or '').strip():
+                continue
+            hit = phones.get((_horeca_norm_name(name), _postal_key(postal)))
+            if not hit:
+                continue
+            cur.execute(
+                f"UPDATE {table} SET phone={ph}{extra_set} WHERE {id_col}={ph}",
+                (hit, rid))
+            n += 1
+            if n % 500 == 0:
+                db.commit()
+        db.commit()
+        if USE_POSTGRES:
+            cur.close()
+        return n
+
+    # osm_venues + book have postal? book has postal via seed; osm has postal.
+    lic_n = _stamp('agco_licensees', 'licence_number',
+                   ', enriched_at=CURRENT_TIMESTAMP')
+    osm_n = _stamp('osm_venues', 'osm_id')
+    book_n = 0
+    try:
+        book_n = _stamp('horeca_accounts', 'id',
+                        ', updated_at=CURRENT_TIMESTAMP')
+    except Exception:
+        pass
+
+    return jsonify({
+        'status': 'ok', 'rows_scanned': scanned,
+        'food_licences_with_phone': kept, 'unique_phone_keys': len(phones),
+        'licensees_phone_enriched': lic_n,
+        'osm_venues_phone_enriched': osm_n,
+        'book_accounts_phone_enriched': book_n,
+        'source': 'Toronto ML&S Business Licences (OGL-Toronto)',
+    })
+
+
 @app.route('/api/horeca/venues', methods=['GET'])
 def api_horeca_venues():
     """Browse the harvested OSM venue universe. Filters: q, city, region,

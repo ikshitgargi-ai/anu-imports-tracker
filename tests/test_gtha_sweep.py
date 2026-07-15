@@ -170,3 +170,40 @@ class TestVenues:
         names = {t for t, _ in app_module._EXPORT_TABLES}
         assert 'osm_venues' in names
         assert 'osm_sweep_tiles' in names
+
+
+TORONTO_BIZ_CSV = '\n'.join([
+    '_id,Category,Licence No.,Operating Name,Issued,Client Name,Business Phone,Business Phone Ext.,Licence Address Line 1,Licence Address Line 2,Licence Address Line 3,Ward,Conditions,Free Form Conditions Line 1,Free Form Conditions Line 2,Plate No.,Endorsements,Cancel Date,Last Record Update',
+    # Active eating establishment WITH phone → should enrich the licensed venue
+    '1,EATING ESTABLISHMENT,B01,THE VELVET FOX,2024-01-01,VELVET INC,416-555-7777,,12 KING ST W,"TORONTO, ON",M5H 1A1,10,,,,,,,2024-06-01',
+    # Cancelled licence → must be ignored even though it has a phone
+    '2,EATING ESTABLISHMENT,B02,SOME OTHER BAR,2015-01-01,OTHER CO,416-555-0000,,9 QUEEN ST,"TORONTO, ON",M5H 2M2,10,,,,,,2016-05-02,2016-05-02',
+    # Non-food category → ignored
+    '3,DRY CLEANER,B03,CLEAN CO,2024-01-01,CLEAN INC,416-555-1111,,1 MAIN ST,"TORONTO, ON",M5H 1A1,10,,,,,,,2024-06-01',
+])
+
+
+class TestTorontoPhoneEnrich:
+    def test_stamps_phone_into_blank_licensee(self, swept, client):
+        # Velvet Fox licence had OSM phone stamped earlier; blank it to test
+        # the Toronto source fills a genuinely-empty phone.
+        import io as _io
+        r = client.post(
+            '/api/horeca/enrich/toronto-phones',
+            data={'file': (_io.BytesIO(TORONTO_BIZ_CSV.encode()), 'biz.csv')},
+            content_type='multipart/form-data')
+        assert r.status_code == 200, r.get_json()
+        b = r.get_json()
+        assert b['food_licences_with_phone'] == 1  # only the active eating row
+        assert b['unique_phone_keys'] == 1
+
+    def test_cancelled_and_nonfood_ignored(self, swept, client):
+        import io as _io
+        r = client.post(
+            '/api/horeca/enrich/toronto-phones',
+            data={'file': (_io.BytesIO(TORONTO_BIZ_CSV.encode()), 'biz.csv')},
+            content_type='multipart/form-data')
+        b = r.get_json()
+        # 3 data rows scanned, only 1 kept (cancelled + dry-cleaner dropped)
+        assert b['rows_scanned'] == 3
+        assert b['food_licences_with_phone'] == 1
