@@ -7863,16 +7863,12 @@ def api_horeca_agco_sync():
             {'id': b[0], 'city': (b[2] or '').strip().lower()})
 
     today = _date.today().isoformat()
-    ph = '%s' if USE_POSTGRES else '?'
     existing = {r[0] for r in db_fetchall('SELECT licence_number FROM agco_licensees')}
-    inserted = updated = matched = 0
-    cur = db.cursor() if USE_POSTGRES else db
+    matched = 0
+    tuples = []
     for r in rows:
         norm = _horeca_norm_name(r['name'])
         n_count = name_counts.get(norm, 1)
-        indep = 1 if n_count <= 1 else 0
-        region = _horeca_region(r['city'])
-        kind = _agco_kind(r['name'])
         match_id = None
         for cand in book_by_norm.get(norm, ()):
             if not cand['city'] or not r['city'] or \
@@ -7881,30 +7877,48 @@ def api_horeca_agco_sync():
                 break
         if match_id:
             matched += 1
-        if r['lic'] in existing:
-            cur.execute(
-                f"UPDATE agco_licensees SET name={ph}, address={ph}, city={ph}, "
-                f"postal={ph}, licence_type={ph}, status={ph}, region={ph}, "
-                f"kind={ph}, name_count={ph}, is_independent={ph}, "
-                f"matched_account_id={ph}, last_seen={ph}, "
-                f"updated_at=CURRENT_TIMESTAMP WHERE licence_number={ph}",
-                (r['name'], r['address'], r['city'], r['postal'], r['ltype'],
-                 r['status'], region, kind, n_count, indep, match_id, today,
-                 r['lic']))
-            updated += 1
-        else:
-            cur.execute(
-                f"INSERT INTO agco_licensees (licence_number, name, address, "
-                f"city, postal, licence_type, status, region, kind, name_count, "
-                f"is_independent, matched_account_id, first_seen, last_seen) "
-                f"VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph})",
-                (r['lic'], r['name'], r['address'], r['city'], r['postal'],
-                 r['ltype'], r['status'], region, kind, n_count, indep,
-                 match_id, today, today))
-            inserted += 1
-    db.commit()
+        tuples.append((r['lic'], r['name'], r['address'], r['city'],
+                       r['postal'], r['ltype'], r['status'],
+                       _horeca_region(r['city']), _agco_kind(r['name']),
+                       n_count, 1 if n_count <= 1 else 0, match_id,
+                       today, today))
+    inserted = sum(1 for t in tuples if t[0] not in existing)
+    updated = len(tuples) - inserted
+
+    # Batched upserts, committed per chunk: 18k row-by-row statements over a
+    # pooled Neon connection blows past the Render proxy timeout; batches of
+    # 1,000 land in seconds and a killed request loses at most one chunk
+    # (re-running the sync is idempotent).
+    upsert_tail = (
+        "ON CONFLICT (licence_number) DO UPDATE SET "
+        "name=excluded.name, address=excluded.address, city=excluded.city, "
+        "postal=excluded.postal, licence_type=excluded.licence_type, "
+        "status=excluded.status, region=excluded.region, kind=excluded.kind, "
+        "name_count=excluded.name_count, "
+        "is_independent=excluded.is_independent, "
+        "matched_account_id=excluded.matched_account_id, "
+        "last_seen=excluded.last_seen, updated_at=CURRENT_TIMESTAMP")
+    cols = ("licence_number, name, address, city, postal, licence_type, "
+            "status, region, kind, name_count, is_independent, "
+            "matched_account_id, first_seen, last_seen")
+    BATCH = 1000
     if USE_POSTGRES:
+        from psycopg2.extras import execute_values
+        cur = db.cursor()
+        for i in range(0, len(tuples), BATCH):
+            execute_values(
+                cur,
+                f"INSERT INTO agco_licensees ({cols}) VALUES %s {upsert_tail}",
+                tuples[i:i + BATCH])
+            db.commit()
         cur.close()
+    else:
+        phs = ','.join(['?'] * 14)
+        for i in range(0, len(tuples), BATCH):
+            db.executemany(
+                f"INSERT INTO agco_licensees ({cols}) VALUES ({phs}) {upsert_tail}",
+                tuples[i:i + BATCH])
+            db.commit()
 
     by_region = {reg: 0 for reg in ('core', 'gtha', 'other')}
     for r in rows:
