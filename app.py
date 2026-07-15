@@ -97,6 +97,17 @@ def _cache_put(key, val, code, ttl_seconds):
         _cache_store[key] = (datetime.utcnow().timestamp() + ttl_seconds, val, code)
 
 
+def _cache_invalidate(*view_names):
+    """Drop every cached response for the named view functions.
+
+    Ledger writes must show on the very next listings read, not after the
+    TTL runs out — cache keys start with the wrapped view's __name__."""
+    prefixes = tuple(f'{n}:' for n in view_names)
+    with _cache_lock:
+        for k in [k for k in _cache_store if k.startswith(prefixes)]:
+            _cache_store.pop(k, None)
+
+
 def cached_response(ttl_seconds: int = 300, key_args: tuple = ()):
     """Decorator: cache the JSON response of a Flask handler.
 
@@ -1432,6 +1443,12 @@ def init_db():
             ('activities', 'visit_date', "TEXT"),
             ('activities', 'deleted_at', "TIMESTAMP"),
             ('activities', 'updated_at', "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            # Silent GPS capture on activity submission — the Postgres branch
+            # already migrates these; the SQLite (dev/test) branch was missing
+            # them, which broke POST /api/crm/activities locally.
+            ('activities', 'accuracy_m', "REAL"),
+            ('activities', 'client_ts', "TIMESTAMP"),
+            ('activities', 'distance_from_store_m', "REAL"),
             # HORECA prospecting (Anu Imports fork) — provenance for open-data imports
             ('horeca_accounts', 'source', "TEXT DEFAULT 'manual'"),
             ('horeca_accounts', 'licence_no', "TEXT DEFAULT ''"),
@@ -3931,6 +3948,13 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
     ph = _sod_ph()
     conn = _sod_get_conn()
     try:
+        # Lazy DDL for the canonical listing ledger — done BEFORE the ingest
+        # transaction starts (it commits), so the step-7d fold always has its
+        # tables. Module-flag guarded: a no-op after the first call.
+        try:
+            _ensure_listing_ledger(conn)
+        except Exception as _ee:
+            print(f"[SOD-{source}] listing-ledger DDL skipped (non-fatal): {_ee}")
         cur = conn.cursor()
         # Record the run as 'running' up front for observability
         if USE_POSTGRES:
@@ -4045,6 +4069,9 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
         # snapshot for that SKU. Insert into sod_store_sku_changes (idempotent via
         # UNIQUE constraint).
         store_change_inserts = []  # (sku, store_number, change_date, old_status, new_status, change_type)
+        # Canonical-ledger reconfirmations: (sku, store) present with status 'L'
+        # in this snapshot but NOT a change event this run → RECONFIRMED.
+        ledger_reconfirms = []
         tracked_in_snapshot = {sku: agg for sku, agg in per_sku.items() if sku in SOD_TRACKED_SKUS}
         for tracked_sku in tracked_in_snapshot:
             # Find the previous snapshot date for this SKU (the one BEFORE today's)
@@ -4083,6 +4110,11 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
                 r['store_number']: r['status']
                 for r in latest_rows if r['sku'] == tracked_sku
             }
+            # Every store carrying this SKU right now (status 'L') is a presence
+            # proof for the ledger — deduped to one RECONFIRMED per day/source.
+            for _store, _st in current_per_store.items():
+                if _st == 'L':
+                    ledger_reconfirms.append((tracked_sku, _store))
             # Diff: what's new, what changed, what disappeared
             for store, new_st in current_per_store.items():
                 old_st = prior_per_store.get(store)
@@ -4207,6 +4239,12 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
                 # massive history table didn't complete), ON CONFLICT raises;
                 # we catch and fall back to plain INSERT to keep the daily
                 # sync from breaking.
+                # SAVEPOINT so a failure here can only lose THIS statement.
+                # The old fallback called conn.rollback(), which silently threw
+                # away the sod_inventory + sod_products writes of the whole
+                # ingest while still committing a 'success' run row (the
+                # July-4 data-loss class fixed on the Dripp engine).
+                cur.execute("SAVEPOINT sp_listing_changes")
                 try:
                     psycopg2.extras.execute_values(
                         cur,
@@ -4217,15 +4255,14 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
                            DO NOTHING""",
                         change_inserts,
                     )
+                    cur.execute("RELEASE SAVEPOINT sp_listing_changes")
                 except Exception as _conflict_err:
                     # If the unique index doesn't exist (e.g. dedupe step on a
                     # massive history table didn't complete), ON CONFLICT raises.
-                    # Fall back to plain INSERT to keep the daily sync alive.
+                    # Roll back to the SAVEPOINT (NOT the whole transaction) and
+                    # fall back to plain INSERT to keep the daily sync alive.
                     print(f"[SOD-{source}] ON CONFLICT failed ({_conflict_err}), retrying with plain INSERT")
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_listing_changes")
                     psycopg2.extras.execute_values(
                         cur,
                         """INSERT INTO sod_listing_changes
@@ -4233,6 +4270,7 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
                            VALUES %s""",
                         change_inserts,
                     )
+                    cur.execute("RELEASE SAVEPOINT sp_listing_changes")
             else:
                 cur.executemany(
                     """INSERT OR IGNORE INTO sod_listing_changes
@@ -4260,6 +4298,41 @@ def run_sod_sync(source='daily_a', filename=None, client=None):
                        ON CONFLICT(sku, store_number, change_date, change_type) DO NOTHING""",
                     store_change_inserts,
                 )
+
+        # 7d) Fold this snapshot into the CANONICAL LISTING LEDGER. Wrapped
+        # in a SAVEPOINT so a ledger error can never poison the sod_inventory /
+        # sod_products writes above. LISTED/DELISTED changes get a per-event
+        # audit row; the high-volume steady-state RECONFIRMs are summarised.
+        try:
+            if USE_POSTGRES:
+                cur.execute("SAVEPOINT sp_ledger")
+            changed_pairs = {(t[0], t[1]) for t in store_change_inserts if t[1] is not None}
+            ledger_new = 0
+            for (c_sku, c_store, _cd, _old, _new, c_type) in store_change_inserts:
+                if c_store is None:
+                    continue
+                ev = _ledger_event_for(c_type)
+                if ev in ('LISTED', 'DELISTED'):
+                    if _ledger_record(cur, c_sku, c_store, ev, 'sod', snapshot_date,
+                                      snapshot_date, audit=True):
+                        ledger_new += 1
+            for (r_sku, r_store) in ledger_reconfirms:
+                if (r_sku, r_store) in changed_pairs:
+                    continue  # already captured as LISTED/RELISTED this run
+                if _ledger_record(cur, r_sku, r_store, 'RECONFIRMED', 'sod', snapshot_date,
+                                  snapshot_date, audit=False):
+                    ledger_new += 1
+            if USE_POSTGRES:
+                cur.execute("RELEASE SAVEPOINT sp_ledger")
+            print(f"[SOD-{source}] step 7d: +{ledger_new} listing_ledger rows "
+                  f"({len(ledger_reconfirms)} reconfirm candidates)")
+        except Exception as _le:
+            if USE_POSTGRES:
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_ledger")
+                except Exception:
+                    pass
+            print(f"[SOD-{source}] listing_ledger fold skipped (non-fatal): {_le}")
 
         print(f"[SOD-{source}] step 7/8 done")
 
@@ -8510,10 +8583,37 @@ _EXPORT_TABLES = [
     ('sod_listing_changes',        'id'),
     ('sod_store_sku_changes',      'id'),
     ('sod_sync_runs',              'id'),
+    # HORECA v2 + live lcbo.com engine (lazily-created tables ride the daily
+    # backup too; the export tolerates their absence until first use).
+    ('agco_licensees',             'licence_number'),
+    ('horeca_activities',          'id'),
+    ('lcbo_live_batches',          'id'),
+    ('lcbo_live_snapshots',        'id'),
+    ('live_listing_events',        'id'),
+    # THE canonical listing ledger — the crown jewel: the daily email backup
+    # MUST carry it (it survives SOD loss). store_listings is the derived
+    # fold, exported alongside so a restore is instant.
+    ('listing_ledger',             'id'),
+    ('store_listings',             'id'),
     # Optional (large)
     ('sod_inventory',              None),  # 1M+ rows, only included with ?include=all
     ('inventory_history',          None),
 ]
+
+# RETENTION GUARD — these tables are append-only records of what happened.
+# No code path may DELETE or TRUNCATE them (soft-delete/archive only); the
+# import 'replace' mode falls back to merge for them, and tests/test_ledger.py
+# asserts the membership so future code keeps the guardrail.
+# The immutable listing_ledger is the source of truth — a restore must MERGE
+# it, never TRUNCATE-and-replace. store_listings is a derived cache (the
+# ledger rebuild owns it), but protecting it keeps a restore from wiping it
+# before a rebuild runs; the rebuild's controlled DELETE stays the only way
+# it is cleared.
+_RETENTION_PROTECTED_TABLES = frozenset((
+    'sod_inventory', 'lcbo_live_snapshots', 'activities',
+    'listing_ledger', 'store_listings', 'agco_licensees',
+    'horeca_accounts', 'deals', 'horeca_activities',
+))
 
 
 # NB: _admin_token_ok / require_admin_token / require_app_origin are defined
@@ -8612,18 +8712,24 @@ def api_admin_import():
             continue
         ins = upd = skip = 0
         err = None
+        # RETENTION GUARD: 'replace' NEVER truncates a protected table —
+        # those are append-only history. Fall back to merge (upsert) so the
+        # import still lands without destroying what is already there.
+        table_mode = mode
+        if mode == 'replace' and tname in _RETENTION_PROTECTED_TABLES:
+            table_mode = 'merge' if pk else 'append'
         try:
             if USE_POSTGRES:
                 cur = db.cursor()
-                if mode == 'replace':
+                if table_mode == 'replace':
                     cur.execute(f"TRUNCATE TABLE {tname} RESTART IDENTITY CASCADE")
                 placeholders = ','.join(['%s'] * len(cols))
                 col_list = ','.join(cols)
-                if mode == 'merge' and pk:
+                if table_mode == 'merge' and pk:
                     update_set = ','.join(f"{c}=EXCLUDED.{c}" for c in cols if c != pk)
                     sql = (f"INSERT INTO {tname} ({col_list}) VALUES ({placeholders}) "
                            f"ON CONFLICT ({pk}) DO UPDATE SET {update_set}")
-                elif mode == 'append' and pk:
+                elif pk and table_mode != 'replace':
                     sql = f"INSERT INTO {tname} ({col_list}) VALUES ({placeholders}) ON CONFLICT ({pk}) DO NOTHING"
                 else:
                     sql = f"INSERT INTO {tname} ({col_list}) VALUES ({placeholders})"
@@ -8646,11 +8752,11 @@ def api_admin_import():
                 cur.close()
             else:
                 # SQLite path (dev only)
-                if mode == 'replace':
-                    db.execute(f"DELETE FROM {tname}")
+                if table_mode == 'replace':
+                    db.execute(f"DELETE FROM {tname}")  # never a protected table (guard above)
                 placeholders = ','.join(['?'] * len(cols))
                 col_list = ','.join(cols)
-                verb = 'INSERT OR REPLACE' if mode == 'merge' else ('INSERT OR IGNORE' if mode == 'append' else 'INSERT')
+                verb = 'INSERT OR REPLACE' if table_mode == 'merge' else ('INSERT OR IGNORE' if table_mode == 'append' else 'INSERT')
                 sql = f"{verb} INTO {tname} ({col_list}) VALUES ({placeholders})"
                 for r in rows:
                     vals = tuple(r.get(c) for c in cols)
@@ -8668,6 +8774,9 @@ def api_admin_import():
         except Exception as e:
             err = f"{type(e).__name__}: {str(e)[:300]}"
         results[tname] = {'inserted': ins, 'updated': upd, 'skipped': skip, 'error': err}
+        if table_mode != mode:
+            results[tname]['mode'] = table_mode
+            results[tname]['note'] = 'retention guard: protected table is never truncated'
 
     return jsonify({
         'status': 'completed',
@@ -19687,6 +19796,41 @@ def api_crm_activities_create():
         except Exception as e:
             print(f'[activity-log] sku outcome insert failed: {e}')
 
+    # Feed the CANONICAL LISTING LEDGER: a rep logging outcome 'listed' for a
+    # SKU at an LCBO store is authoritative proof of a listing even if SOD and
+    # live never showed it — the ultimate SOD-loss insurance. ONLY 'listed'
+    # maps ('discussed' / 'sampled' / 'declined' / 'tasting' / 'ordered' are
+    # not listing events). Non-fatal: a ledger hiccup never fails the visit.
+    ledger_events = 0
+    if sku_outcomes and store_number:
+        try:
+            _sn = int(store_number)
+        except (TypeError, ValueError):
+            _sn = None
+        if _sn is not None:
+            try:
+                _ensure_listing_ledger(db)
+                observed = (str(visit_date)[:10] if visit_date
+                            else _toronto_today().isoformat())
+                lcur = db.cursor()
+                for so in sku_outcomes:
+                    if str(so.get('outcome') or '').strip().lower() != 'listed':
+                        continue
+                    if _ledger_record(lcur, str(so['sku']).zfill(7), _sn, 'LISTED',
+                                      'rep', rep_name, observed,
+                                      note=str(so.get('competitor_notes') or '')[:200]):
+                        ledger_events += 1
+                db.commit()
+                lcur.close()
+                if ledger_events:
+                    _cache_invalidate('api_listings', 'api_listings_added')
+            except Exception as _le:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                print(f'[activity-log] listing_ledger fold skipped (non-fatal): {_le}')
+
     # Optional: if outcome suggests pipeline advancement, upsert a deal row
     # (e.g., "samples_left" → create/update deal with stage='samples_left')
     suggested_stage = d.get('advance_pipeline_stage')
@@ -19737,7 +19881,7 @@ def api_crm_activities_create():
             except Exception as e:
                 print(f'[activity-log] pipeline advance failed: {e}')
 
-    return jsonify({'status': 'ok', 'id': activity_id})
+    return jsonify({'status': 'ok', 'id': activity_id, 'ledger_events': ledger_events})
 
 
 # =========================== Rep quotas ===========================
@@ -23240,6 +23384,313 @@ def _pad_sku(sku) -> str:
     return str(sku or '').strip().zfill(7)
 
 
+# ============================================================================
+# CANONICAL LISTING LEDGER — ported from the proven Dripp Tracker engine.
+#
+# listing_ledger is the immutable, append-only, source-independent record of
+# every listing event (LISTED / DELISTED / RECONFIRMED) from every source
+# (sod / live / rep / manual). It is the source of truth: even if SOD is lost
+# we still have an accurate track of every listing ever added.
+#
+# store_listings is a MATERIALIZED cache of the current state — 100% rebuildable
+# from the ledger alone. The ledger is NEVER updated or deleted (a test greps
+# app.py to enforce this); store_listings is derived and may be rebuilt.
+#
+# The fold is a pure function of the ledger, so the incremental single-event
+# path (_fold_one_store_listing) and the full rebuild (_rebuild_store_listings)
+# can never diverge — both call _ledger_compute_state on the same aggregates.
+# ============================================================================
+
+from flask import has_request_context as _has_request_context
+
+_LISTING_LEDGER_READY = False
+
+
+def _ensure_listing_ledger(db):
+    """Idempotent DDL for the ledger tables (both Postgres and SQLite).
+
+    Lazily called (same pattern as _ensure_horeca_v2 / _ensure_live_tables) so
+    the giant init functions stay untouched. Never destructive.
+    """
+    global _LISTING_LEDGER_READY
+    if _LISTING_LEDGER_READY:
+        return
+    pk = 'BIGSERIAL PRIMARY KEY' if USE_POSTGRES else 'INTEGER PRIMARY KEY AUTOINCREMENT'
+    now_default = 'NOW()' if USE_POSTGRES else 'CURRENT_TIMESTAMP'
+    date_type = 'DATE' if USE_POSTGRES else 'TEXT'
+    stmts = [
+        # listing_ledger — IMMUTABLE append-only event log, the source of truth.
+        # NEVER UPDATE/DELETE (enforced by a test that greps app.py). The UNIQUE
+        # guard makes re-ingesting a day idempotent (ON CONFLICT DO NOTHING).
+        f'''CREATE TABLE IF NOT EXISTS listing_ledger (
+                id {pk},
+                sku TEXT NOT NULL,
+                store_number INTEGER NOT NULL,
+                event TEXT NOT NULL,
+                source TEXT NOT NULL,
+                source_detail TEXT DEFAULT '',
+                observed_date {date_type},
+                recorded_at TIMESTAMP DEFAULT {now_default},
+                note TEXT DEFAULT '',
+                UNIQUE(sku, store_number, event, source, observed_date)
+            )''',
+        # store_listings — MATERIALIZED current state, 100% rebuildable from the
+        # ledger alone. This is a cache of the fold; it MAY be updated/rebuilt,
+        # but the ledger is the truth.
+        f'''CREATE TABLE IF NOT EXISTS store_listings (
+                id {pk},
+                sku TEXT NOT NULL,
+                store_number INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'LISTED',
+                first_listed_date {date_type},
+                last_confirmed_date {date_type},
+                delisted_date {date_type},
+                sources_seen TEXT DEFAULT '',
+                confirm_count INTEGER DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT {now_default},
+                UNIQUE(sku, store_number)
+            )''',
+        "CREATE INDEX IF NOT EXISTS idx_ledger_sku_store ON listing_ledger(sku, store_number)",
+        "CREATE INDEX IF NOT EXISTS idx_ledger_observed ON listing_ledger(observed_date)",
+        "CREATE INDEX IF NOT EXISTS idx_ledger_recorded ON listing_ledger(recorded_at)",
+        "CREATE INDEX IF NOT EXISTS idx_store_listings_sku ON store_listings(sku)",
+        "CREATE INDEX IF NOT EXISTS idx_store_listings_status ON store_listings(status)",
+    ]
+    if USE_POSTGRES:
+        cur = db.cursor()
+        for s in stmts:
+            cur.execute(s)
+        db.commit()
+        cur.close()
+    else:
+        for s in stmts:
+            db.execute(s)
+        db.commit()
+    _LISTING_LEDGER_READY = True
+
+
+def _ledger_ph():
+    return '%s' if USE_POSTGRES else '?'
+
+
+def _change_kind(change_type):
+    """Bucket a change/event type into new_listing | delisting | restock | other."""
+    if change_type in ('NEW_LISTING', 'RELISTED', 'LIVE_NEW_LISTING'):
+        return 'new_listing'
+    if change_type in ('DROPPED', 'DELISTED', 'DELISTING_NOW', 'LIVE_DELISTED'):
+        return 'delisting'
+    if change_type in ('LIVE_RESTOCK', 'RESTOCK'):
+        return 'restock'
+    return 'other'
+
+
+def _ledger_event_for(change_type):
+    """Map a source-specific change/event type to a canonical ledger event.
+
+    Reuses _change_kind so SOD (NEW_LISTING/DROPPED/…) and live
+    (LIVE_NEW_LISTING/LIVE_DELISTED/LIVE_RESTOCK) share one mapping. Returns
+    None for events that don't move the listed/delisted state (e.g.
+    STATUS_FLIP / BASELINE)."""
+    kind = _change_kind(change_type)
+    if kind == 'new_listing':
+        return 'LISTED'
+    if kind == 'delisting':
+        return 'DELISTED'
+    if kind == 'restock':
+        return 'RECONFIRMED'
+    return None
+
+
+def _ledger_compute_state(first_listed, last_confirmed, max_delist):
+    """The pure fold decision shared by the incremental and full-rebuild paths.
+
+    A store is DELISTED only when the most recent delist is on/after the most
+    recent proof of presence (last_confirmed_date); otherwise it is LISTED.
+    Dates are DATE objects on Postgres and 'YYYY-MM-DD' strings on SQLite; both
+    compare chronologically."""
+    if max_delist is not None and (last_confirmed is None or max_delist >= last_confirmed):
+        return 'DELISTED', max_delist
+    return 'LISTED', None
+
+
+def _upsert_store_listing(cur, sku, store_number, first_listed, last_confirmed,
+                          max_delist, confirm_count, sources):
+    """Write one materialized store_listings row from already-folded aggregates."""
+    status, delisted_date = _ledger_compute_state(first_listed, last_confirmed, max_delist)
+    sources_seen = ','.join(sources)
+    ph = _ledger_ph()
+    now_fn = 'NOW()' if USE_POSTGRES else 'CURRENT_TIMESTAMP'
+    cur.execute(
+        f"INSERT INTO store_listings "
+        f"(sku, store_number, status, first_listed_date, last_confirmed_date, "
+        f" delisted_date, sources_seen, confirm_count, updated_at) "
+        f"VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{now_fn}) "
+        f"ON CONFLICT (sku, store_number) DO UPDATE SET "
+        f"  status=excluded.status, "
+        f"  first_listed_date=excluded.first_listed_date, "
+        f"  last_confirmed_date=excluded.last_confirmed_date, "
+        f"  delisted_date=excluded.delisted_date, "
+        f"  sources_seen=excluded.sources_seen, "
+        f"  confirm_count=excluded.confirm_count, "
+        f"  updated_at={now_fn}",
+        (sku, store_number, status, first_listed, last_confirmed,
+         delisted_date, sources_seen, int(confirm_count or 0)),
+    )
+
+
+def _fold_one_store_listing(cur, sku, store_number):
+    """Recompute the store_listings row for ONE (sku, store) from its ledger
+    rows. Identical fold to _rebuild_store_listings so cache and rebuild agree."""
+    ph = _ledger_ph()
+    cur.execute(
+        f"SELECT "
+        f"  MIN(CASE WHEN event='LISTED' THEN observed_date END), "
+        f"  MAX(CASE WHEN event IN ('LISTED','RECONFIRMED') THEN observed_date END), "
+        f"  MAX(CASE WHEN event='DELISTED' THEN observed_date END), "
+        f"  SUM(CASE WHEN event IN ('LISTED','RECONFIRMED') THEN 1 ELSE 0 END) "
+        f"FROM listing_ledger WHERE sku={ph} AND store_number={ph}",
+        (sku, store_number),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return
+    first_listed, last_confirmed, max_delist, confirm_count = row[0], row[1], row[2], row[3]
+    if first_listed is None and last_confirmed is None and max_delist is None and not confirm_count:
+        return  # no ledger rows for this pair — nothing to materialize
+    cur.execute(
+        f"SELECT DISTINCT source FROM listing_ledger "
+        f"WHERE sku={ph} AND store_number={ph} AND event IN ('LISTED','RECONFIRMED') "
+        f"ORDER BY source",
+        (sku, store_number),
+    )
+    sources = [r[0] for r in cur.fetchall()]
+    _upsert_store_listing(cur, sku, store_number, first_listed, last_confirmed,
+                          max_delist, confirm_count, sources)
+
+
+def _ledger_audit(cur, event, sku, store_number, source, source_detail,
+                  observed_date, note):
+    """Write the event_log row for a ledger mutation on the SAME cursor/txn as
+    the ledger insert (in-txn audit). Never blocks the write."""
+    try:
+        ph = _ledger_ph()
+        ip = ua = ''
+        if _has_request_context():
+            ip = (request.headers.get('X-Forwarded-For', request.remote_addr or '') or '')[:50]
+            ua = (request.headers.get('User-Agent', '') or '')[:200]
+        payload = json.dumps({
+            'sku': sku, 'store_number': store_number, 'event': event,
+            'source': source, 'source_detail': source_detail,
+            'observed_date': str(observed_date) if observed_date is not None else None,
+            'note': note or '',
+        })
+        cur.execute(
+            f"INSERT INTO event_log (event_type, entity_type, entity_id, actor, "
+            f"payload_json, ip_address, user_agent) VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph})",
+            (f"listing_{event.lower()}", 'listing', f"{sku}:{store_number}",
+             source or '', payload, ip, ua),
+        )
+    except Exception as e:
+        print(f"[listing_ledger] audit failed (non-fatal): {e}")
+
+
+def _ledger_record(cur, sku, store_number, event, source, source_detail,
+                   observed_date, note='', audit=True, fold=True):
+    """Append ONE immutable event to listing_ledger (idempotent via the UNIQUE
+    guard) and fold it into the materialized store_listings row — all on the
+    caller's cursor/transaction, audited to event_log. Returns True iff a NEW
+    ledger row was written (a duplicate day/source is a no-op).
+
+    event:  'LISTED' | 'DELISTED' | 'RECONFIRMED'
+    source: 'sod' | 'live' | 'rep' | 'manual'
+    """
+    if not sku or event not in ('LISTED', 'DELISTED', 'RECONFIRMED'):
+        return False
+    try:
+        store_number = int(store_number)
+    except (TypeError, ValueError):
+        return False
+    ph = _ledger_ph()
+    cur.execute(
+        f"INSERT INTO listing_ledger "
+        f"(sku, store_number, event, source, source_detail, observed_date, note) "
+        f"VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph}) "
+        f"ON CONFLICT (sku, store_number, event, source, observed_date) DO NOTHING",
+        (sku, store_number, event, source, source_detail or '', observed_date, note or ''),
+    )
+    if cur.rowcount != 1:
+        return False  # duplicate — already recorded for this day/source
+    if fold:
+        _fold_one_store_listing(cur, sku, store_number)
+    if audit:
+        _ledger_audit(cur, event, sku, store_number, source, source_detail, observed_date, note)
+    return True
+
+
+def _ledger_bulk_insert(cur, rows):
+    """Idempotent bulk append into listing_ledger (no per-row fold — the caller
+    rebuilds store_listings once at the end, which is far cheaper for backfill).
+
+    rows: iterable of (sku, store_number, event, source, source_detail,
+    observed_date, note). Returns the number of rows attempted."""
+    rows = [r for r in rows if r and r[0] and r[2] in ('LISTED', 'DELISTED', 'RECONFIRMED')]
+    if not rows:
+        return 0
+    if USE_POSTGRES:
+        psycopg2.extras.execute_values(
+            cur,
+            "INSERT INTO listing_ledger "
+            "(sku, store_number, event, source, source_detail, observed_date, note) "
+            "VALUES %s "
+            "ON CONFLICT (sku, store_number, event, source, observed_date) DO NOTHING",
+            rows,
+        )
+    else:
+        cur.executemany(
+            "INSERT INTO listing_ledger "
+            "(sku, store_number, event, source, source_detail, observed_date, note) "
+            "VALUES (?,?,?,?,?,?,?) "
+            "ON CONFLICT (sku, store_number, event, source, observed_date) DO NOTHING",
+            rows,
+        )
+    return len(rows)
+
+
+def _rebuild_store_listings(cur):
+    """DELETE + recompute the ENTIRE store_listings cache from listing_ledger
+    only — proving the materialized view is a pure function of the immutable
+    ledger. The ledger itself is never touched. Returns rows written."""
+    cur.execute(
+        "SELECT sku, store_number, "
+        "  MIN(CASE WHEN event='LISTED' THEN observed_date END), "
+        "  MAX(CASE WHEN event IN ('LISTED','RECONFIRMED') THEN observed_date END), "
+        "  MAX(CASE WHEN event='DELISTED' THEN observed_date END), "
+        "  SUM(CASE WHEN event IN ('LISTED','RECONFIRMED') THEN 1 ELSE 0 END) "
+        "FROM listing_ledger GROUP BY sku, store_number"
+    )
+    aggs = cur.fetchall()
+    cur.execute(
+        "SELECT DISTINCT sku, store_number, source FROM listing_ledger "
+        "WHERE event IN ('LISTED','RECONFIRMED') ORDER BY sku, store_number, source"
+    )
+    src_map = {}
+    for r in cur.fetchall():
+        src_map.setdefault((r[0], int(r[1])), []).append(r[2])
+    # store_listings is a derived cache (not source data): clearing it and
+    # rebuilding from the immutable ledger loses nothing.
+    cur.execute("DELETE FROM store_listings")
+    count = 0
+    for r in aggs:
+        sku = r[0]
+        store_number = int(r[1])
+        first_listed, last_confirmed, max_delist, confirm_count = r[2], r[3], r[4], r[5]
+        sources = src_map.get((sku, store_number), [])
+        _upsert_store_listing(cur, sku, store_number, first_listed, last_confirmed,
+                              max_delist, confirm_count, sources)
+        count += 1
+    return count
+
+
 def _ensure_live_tables(db):
     """Idempotent DDL for the live-engine tables (both Postgres and SQLite).
 
@@ -23392,6 +23843,7 @@ def run_live_batch(triggered_by='scheduler'):
         skus = sorted(SOD_TRACKED_SKUS.keys())
         conn = _sod_get_conn()
         _ensure_live_tables(conn)
+        _ensure_listing_ledger(conn)
         cur = conn.cursor()
         ph = _sod_ph()
         cur.execute(
@@ -23479,6 +23931,40 @@ def run_live_batch(triggered_by='scheduler'):
                         (e_sku, sn, etype, oq, nq, batch_id, prev_batch_id, today_str),
                     )
                     events_created += 1
+
+            # Fold this SKU's live signal into the CANONICAL LISTING LEDGER:
+            # LIVE_NEW_LISTING → LISTED, LIVE_DELISTED → DELISTED, and every
+            # store that appears this batch → RECONFIRMED (deduped to one/day).
+            # SAVEPOINT-guarded so a ledger error never loses the snapshot writes.
+            try:
+                if USE_POSTGRES:
+                    cur.execute("SAVEPOINT sp_ledger_live")
+                listed_here = set()
+                if prev_batch_id:
+                    for e_sku, sn, etype, oq, nq in events:
+                        lev = _ledger_event_for(etype)
+                        if lev == 'LISTED':
+                            _ledger_record(cur, e_sku, sn, 'LISTED', 'live', batch_id,
+                                           today_str, audit=True)
+                            listed_here.add(sn)
+                        elif lev == 'DELISTED':
+                            _ledger_record(cur, e_sku, sn, 'DELISTED', 'live', batch_id,
+                                           today_str, audit=True)
+                for sn in new_qty:
+                    if sn in listed_here:
+                        continue  # already recorded as a LISTED this batch
+                    _ledger_record(cur, sku, sn, 'RECONFIRMED', 'live', batch_id,
+                                   today_str, audit=False)
+                if USE_POSTGRES:
+                    cur.execute("RELEASE SAVEPOINT sp_ledger_live")
+            except Exception as _le:
+                if USE_POSTGRES:
+                    try:
+                        cur.execute("ROLLBACK TO SAVEPOINT sp_ledger_live")
+                    except Exception:
+                        pass
+                errors.append(f"ledger fold skipped for {sku}: {_le}")
+                print(f"[LIVE] listing_ledger fold skipped for {sku} (non-fatal): {_le}")
 
         status = 'ok' if not errors else ('error' if not per_sku_rows else 'partial')
         cur.execute(
@@ -23738,9 +24224,14 @@ def api_reconcile():
 
     2-WAY on this fork: rep visits land in activities/activity_sku_outcomes
     (outcome + facings), which record shelf PRESENCE, not unit counts, so the
-    rep_* columns ship null and REP_MISMATCH cannot fire. The response shape
-    matches the Dripp 3-way contract so the frontend and a future rep-count
-    field slot straight in.
+    rep unit columns ship null and REP_MISMATCH cannot fire. The response
+    shape matches the Dripp 3-way contract so the frontend and a future
+    rep-count field slot straight in.
+
+    REP OUTCOME OVERLAY: each row carries rep_outcome + rep_observed_at from
+    the LATEST activity_sku_outcomes row for that (sku, store) — outcome text
+    only, purely informational. No units are invented and no new flag
+    semantics are added; the existing flags are untouched.
 
     The store universe per SKU is the union of stores in the latest SOD
     snapshot and the latest live batch (this fork has no territory book).
@@ -23757,6 +24248,32 @@ def api_reconcile():
     for r in db_fetchall("SELECT store_number, account, city FROM stores"):
         d = row_to_dict(r)
         directory[int(d['store_number'])] = d
+
+    # Rep outcome overlay: latest activity_sku_outcomes row per (sku, store),
+    # joined activities → stores. Informational only (outcome text + when);
+    # never a unit count, never a flag input. Best-effort: reconcile still
+    # answers if the CRM tables are missing/empty.
+    rep_overlay = {}
+    try:
+        for r in db_fetchall(
+            "SELECT aso.sku AS sku, s.store_number AS store_number, "
+            "aso.outcome AS outcome, "
+            "CAST(a.visit_date AS TEXT) AS visit_date, "
+            "CAST(a.created_at AS TEXT) AS created_at "
+            "FROM activity_sku_outcomes aso "
+            "JOIN activities a ON a.id = aso.activity_id "
+            "JOIN stores s ON s.id = a.store_id "
+            "WHERE a.deleted_at IS NULL "
+            "ORDER BY a.id ASC, aso.id ASC"
+        ):
+            d = row_to_dict(r)
+            # ascending order → the last write wins = the LATEST outcome
+            rep_overlay[(_pad_sku(d['sku']), int(d['store_number']))] = {
+                'outcome': d['outcome'] or '',
+                'observed_at': d['visit_date'] or d['created_at'],
+            }
+    except Exception as _oe:
+        print(f'[reconcile] rep outcome overlay skipped (non-fatal): {_oe}')
 
     rows_out = []
     sources = {}
@@ -23777,6 +24294,7 @@ def api_reconcile():
             live_qty = l['qty'] if l else None
             flag = _reconcile_flag(sod_qty, live_qty, None, None)
             dinfo = directory.get(sn) or {}
+            overlay = rep_overlay.get((sku, sn)) or {}
             rows_out.append({
                 'sku': sku,
                 'brand': brand,
@@ -23791,7 +24309,8 @@ def api_reconcile():
                 'live_checked_at': l['checked_at'] if l else None,
                 'rep_units': None,
                 'rep_on_shelf': None,
-                'rep_observed_at': None,
+                'rep_outcome': overlay.get('outcome') or None,
+                'rep_observed_at': overlay.get('observed_at') or None,
                 'rep': None,
                 'delta_sod_live': (sod_qty - live_qty)
                     if (sod_qty is not None and live_qty is not None) else None,
@@ -23802,8 +24321,652 @@ def api_reconcile():
     for r in rows_out:
         summary[r['flag']] = summary.get(r['flag'], 0) + 1
     rows_out.sort(key=lambda r: (r['flag'] == 'MATCH', r['sku'], r['store_number']))
-    return jsonify({'days': days, 'mode': '2-way (SOD vs lcbo.com; rep counts not in schema)',
+    return jsonify({'days': days, 'mode': '2-way + rep outcome overlay',
                     'rows': rows_out, 'summary': summary, 'sources': sources})
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CANONICAL LISTING LEDGER — manual record + backfill + rebuild (writers)
+# and the read endpoints. Ported from the proven Dripp Tracker engine,
+# adapted to this fork (9 tracked SKUs, no territory book, store name/city
+# enriched from the master `stores` directory).
+# ═══════════════════════════════════════════════════════════════════════
+
+def _ledger_brand(sku):
+    return SOD_TRACKED_SKUS.get(sku, ('', ''))[0]
+
+
+def _ledger_product(sku):
+    return SOD_TRACKED_SKUS.get(sku, ('', ''))[1]
+
+
+def _days_between(today, date_str):
+    """Whole days from an ISO date string to `today` (a date); None if unparseable."""
+    if not date_str:
+        return None
+    try:
+        from datetime import date as _date
+        return (today - _date.fromisoformat(str(date_str)[:10])).days
+    except (ValueError, TypeError):
+        return None
+
+
+def _stores_directory():
+    """{store_number: {'account', 'city'}} from the master stores directory."""
+    out = {}
+    try:
+        for r in db_fetchall("SELECT store_number, account, city FROM stores"):
+            d = row_to_dict(r)
+            out[int(d['store_number'])] = {'account': d.get('account'),
+                                           'city': d.get('city')}
+    except Exception as e:
+        print(f'[listings] stores directory read failed (non-fatal): {e}')
+    return out
+
+
+def _xlsx_response(filename, sheet_title, headers, rows):
+    """Build a one-sheet workbook and return it with download-ready headers."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    wb = Workbook()
+    ws = wb.active
+    ws.title = (sheet_title or 'Sheet1')[:31]
+    ws.append(list(headers))
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    for row in rows:
+        ws.append([
+            v if (isinstance(v, (int, float)) and not isinstance(v, bool))
+            else ('' if v is None else str(v))
+            for v in row
+        ])
+    ws.freeze_panes = 'A2'
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return Response(
+        buf.getvalue(),
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        headers={
+            'Content-Disposition': f'attachment; filename="{filename}"',
+            'X-Filename': filename,
+        },
+    )
+
+
+def _api_json(view_name):
+    """Call a sibling endpoint's view function in the current request context
+    and parse its JSON (the cache applies exactly as it would for a direct
+    call)."""
+    result = app.view_functions[view_name]()
+    resp = result[0] if isinstance(result, tuple) else result
+    return json.loads(resp.get_data(as_text=True))
+
+
+@app.route('/api/listings/record', methods=['POST'])
+@require_app_origin
+def api_listings_record():
+    """Manually assert a listing event into the canonical ledger — the ultimate
+    SOD-loss insurance: record a listing we KNOW happened even if no feed shows
+    it. Body: {sku, store_number, event, observed_date?, note?} (source='manual').
+    """
+    body = request.get_json(silent=True) or {}
+    sku = (body.get('sku') or '').strip()
+    event = (body.get('event') or '').strip().upper()
+    note = (body.get('note') or '').strip()[:500]
+    observed_date = (body.get('observed_date') or '').strip() or _toronto_today().isoformat()
+
+    if not sku:
+        return jsonify({'error': 'sku is required'}), 400
+    if event not in ('LISTED', 'DELISTED', 'RECONFIRMED'):
+        return jsonify({'error': 'event must be LISTED, DELISTED or RECONFIRMED'}), 400
+    try:
+        store_number = int(body.get('store_number'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'store_number must be an integer'}), 400
+    try:
+        from datetime import date as _date
+        _date.fromisoformat(observed_date)
+    except ValueError:
+        return jsonify({'error': 'observed_date must be YYYY-MM-DD'}), 400
+
+    conn = None
+    try:
+        conn = _sod_get_conn()
+        _ensure_listing_ledger(conn)
+        cur = conn.cursor()
+        inserted = _ledger_record(cur, sku, store_number, event, 'manual',
+                                  note or 'manual', observed_date, note=note)
+        ph = _ledger_ph()
+        cur.execute(
+            f"SELECT sku, store_number, status, first_listed_date, last_confirmed_date, "
+            f"delisted_date, sources_seen, confirm_count FROM store_listings "
+            f"WHERE sku={ph} AND store_number={ph}",
+            (sku, store_number),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        if conn is not None:
+            try: conn.rollback(); conn.close()
+            except Exception: pass
+        return jsonify({'error': f'record failed: {e}'}), 500
+
+    listing = None
+    if row is not None:
+        listing = {
+            'sku': row[0], 'store_number': row[1], 'status': row[2],
+            'first_listed_date': str(row[3]) if row[3] is not None else None,
+            'last_confirmed_date': str(row[4]) if row[4] is not None else None,
+            'delisted_date': str(row[5]) if row[5] is not None else None,
+            'sources_seen': row[6], 'confirm_count': row[7],
+        }
+    _cache_invalidate('api_listings', 'api_listings_added')
+    return jsonify({
+        'status': 'ok',
+        'inserted': bool(inserted),
+        'event': event, 'sku': sku, 'store_number': store_number,
+        'observed_date': observed_date, 'source': 'manual',
+        'listing': listing,
+        'note': 'Recorded into the canonical listing ledger (append-only, SOD-independent).',
+    }), 201
+
+
+@app.route('/api/listings/backfill', methods=['POST'])
+@require_app_origin
+def api_listings_backfill():
+    """One-time (idempotent) fold of existing history into the canonical ledger,
+    then rebuild store_listings from the full ledger — so nothing is lost. The
+    UNIQUE guard makes re-running a no-op. Folds sod_store_sku_changes,
+    live_listing_events, AND the latest SOD snapshot presence per tracked SKU
+    (covers listings that predate per-store change tracking). Returns
+    {ledger_rows, listings_rows, by_source}.
+    """
+    conn = None
+    try:
+        conn = _sod_get_conn()
+        _ensure_listing_ledger(conn)
+        cur = conn.cursor()
+        ph = _ledger_ph()
+
+        # 1) sod_store_sku_changes → ledger (NEW_LISTING/RELISTED → LISTED,
+        #    DROPPED/DELISTED → DELISTED; observed_date = change_date; source='sod').
+        cur.execute(
+            "SELECT sku, store_number, change_date, change_type "
+            "FROM sod_store_sku_changes WHERE store_number IS NOT NULL"
+        )
+        sod_rows = []
+        for r in cur.fetchall():
+            ev = _ledger_event_for(r[3])
+            if ev is None:
+                continue
+            try:
+                sn = int(r[1])
+            except (TypeError, ValueError):
+                continue
+            sod_rows.append((r[0], sn, ev, 'sod',
+                             str(r[2]) if r[2] is not None else '', r[2], ''))
+        _ledger_bulk_insert(cur, sod_rows)
+
+        # 2) live_listing_events → ledger (map event_type; observed_date=event_date;
+        #    source='live', source_detail=batch_id).
+        cur.execute(
+            "SELECT sku, store_number, event_type, batch_id, event_date "
+            "FROM live_listing_events WHERE store_number IS NOT NULL"
+        )
+        live_rows = []
+        for r in cur.fetchall():
+            ev = _ledger_event_for(r[2])
+            if ev is None:
+                continue
+            try:
+                sn = int(r[1])
+            except (TypeError, ValueError):
+                continue
+            live_rows.append((r[0], sn, ev, 'live', r[3] or '', r[4], ''))
+        _ledger_bulk_insert(cur, live_rows)
+
+        # 3) Latest SOD snapshot presence per tracked SKU → LISTED (idempotent;
+        #    catches stores listed BEFORE per-store change tracking existed —
+        #    without this a pre-tracking listing would never enter the ledger).
+        snap_rows = []
+        for t_sku in sorted(SOD_TRACKED_SKUS.keys()):
+            cur.execute(
+                f"SELECT MAX(snapshot_date) FROM sod_inventory WHERE sku={ph}",
+                (t_sku,),
+            )
+            latest = cur.fetchone()
+            latest = latest[0] if latest else None
+            if not latest:
+                continue
+            cur.execute(
+                f"SELECT store_number FROM sod_inventory "
+                f"WHERE sku={ph} AND snapshot_date={ph} AND status='L'",
+                (t_sku, latest),
+            )
+            for r in cur.fetchall():
+                try:
+                    sn = int(r[0])
+                except (TypeError, ValueError):
+                    continue
+                snap_rows.append((t_sku, sn, 'LISTED', 'sod',
+                                  str(latest), latest, 'backfill: latest snapshot'))
+        _ledger_bulk_insert(cur, snap_rows)
+
+        # 4) Rebuild the materialized view from the full ledger.
+        listings_rows = _rebuild_store_listings(cur)
+
+        # Totals (idempotent — re-running yields the same numbers).
+        cur.execute("SELECT COUNT(*) FROM listing_ledger")
+        ledger_rows = cur.fetchone()[0]
+        cur.execute("SELECT source, COUNT(*) FROM listing_ledger GROUP BY source")
+        by_source = {r[0]: r[1] for r in cur.fetchall()}
+        cur.execute("SELECT event, COUNT(*) FROM listing_ledger GROUP BY event")
+        by_event = {r[0]: r[1] for r in cur.fetchall()}
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        if conn is not None:
+            try: conn.rollback(); conn.close()
+            except Exception: pass
+        return jsonify({'error': f'backfill failed: {e}'}), 500
+
+    try:
+        _log_event('listing_ledger_backfill', 'ledger', 'all',
+                   request.headers.get('X-User', 'admin'),
+                   {'ledger_rows': ledger_rows, 'listings_rows': listings_rows,
+                    'by_source': by_source})
+    except Exception:
+        pass
+    _cache_invalidate('api_listings', 'api_listings_added')
+    return jsonify({
+        'status': 'ok',
+        'ledger_rows': ledger_rows,
+        'listings_rows': listings_rows,
+        'by_source': by_source,
+        'by_event': by_event,
+    })
+
+
+@app.route('/api/listings/rebuild', methods=['POST'])
+@require_app_origin
+def api_listings_rebuild():
+    """Recompute store_listings from listing_ledger ONLY (DELETE + fold) —
+    proving the materialized view is a pure function of the immutable ledger.
+    The ledger is never touched. Returns counts.
+    """
+    conn = None
+    try:
+        conn = _sod_get_conn()
+        _ensure_listing_ledger(conn)
+        cur = conn.cursor()
+        listings_rows = _rebuild_store_listings(cur)
+        cur.execute("SELECT COUNT(*) FROM listing_ledger")
+        ledger_rows = cur.fetchone()[0]
+        cur.execute("SELECT status, COUNT(*) FROM store_listings GROUP BY status")
+        by_status = {r[0]: r[1] for r in cur.fetchall()}
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        if conn is not None:
+            try: conn.rollback(); conn.close()
+            except Exception: pass
+        return jsonify({'error': f'rebuild failed: {e}'}), 500
+
+    try:
+        _log_event('listing_store_rebuild', 'ledger', 'all',
+                   request.headers.get('X-User', 'admin'),
+                   {'listings_rows': listings_rows, 'ledger_rows': ledger_rows})
+    except Exception:
+        pass
+    _cache_invalidate('api_listings', 'api_listings_added')
+    return jsonify({
+        'status': 'ok',
+        'listings_rows': listings_rows,
+        'ledger_rows': ledger_rows,
+        'by_status': by_status,
+    })
+
+
+@app.route('/api/listings', methods=['GET'])
+@cached_response(ttl_seconds=120, key_args=('sku', 'status'))
+def api_listings():
+    """Canonical current listings — read straight from the materialized
+    store_listings cache (a pure fold of the immutable ledger). Works even if
+    SOD is down: the state comes from the ledger, not from a live SOD read.
+
+    Rows: {sku, brand, product_name, store_number, account, city, status,
+    first_listed_date, last_confirmed_date, sources_seen, days_since_confirmed}.
+    Summary: {listed, delisted, by_sku, by_source, first_ever, latest_add}.
+    """
+    _ensure_listing_ledger(get_db())
+    sku_arg = (request.args.get('sku') or '').strip()
+    sku_pad = _pad_sku(sku_arg) if sku_arg else None
+    status_arg = (request.args.get('status') or '').strip().upper()
+    directory = _stores_directory()
+    today = _toronto_today()
+
+    where = []
+    params = []
+    if sku_pad:
+        where.append("sku = ?")
+        params.append(sku_pad)
+    if status_arg in ('LISTED', 'DELISTED'):
+        where.append("status = ?")
+        params.append(status_arg)
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    rows = db_fetchall(
+        "SELECT sku, store_number, status, "
+        "CAST(first_listed_date AS TEXT) AS first_listed_date, "
+        "CAST(last_confirmed_date AS TEXT) AS last_confirmed_date, "
+        "CAST(delisted_date AS TEXT) AS delisted_date, "
+        "sources_seen, confirm_count "
+        f"FROM store_listings {where_sql} "
+        "ORDER BY sku, store_number", params)
+
+    out = []
+    by_sku = {}
+    by_source = {}
+    listed = delisted = 0
+    first_ever = None
+    latest_add = None
+    for r in rows:
+        d = row_to_dict(r)
+        sn = int(d['store_number'])
+        dinfo = directory.get(sn) or {}
+        fld = d['first_listed_date']
+        lcd = d['last_confirmed_date']
+        srcs = [s for s in (d['sources_seen'] or '').split(',') if s]
+        out.append({
+            'sku': d['sku'],
+            'brand': _ledger_brand(d['sku']),
+            'product_name': _ledger_product(d['sku']),
+            'store_number': sn,
+            'account': dinfo.get('account'),
+            'city': dinfo.get('city'),
+            'status': d['status'],
+            'first_listed_date': fld,
+            'last_confirmed_date': lcd,
+            'delisted_date': d['delisted_date'],
+            'sources_seen': d['sources_seen'],
+            'confirm_count': d['confirm_count'],
+            'days_since_confirmed': _days_between(today, lcd),
+        })
+        bs = by_sku.setdefault(d['sku'], {
+            'brand': _ledger_brand(d['sku']), 'listed': 0, 'delisted': 0})
+        if d['status'] == 'DELISTED':
+            delisted += 1
+            bs['delisted'] += 1
+        else:
+            listed += 1
+            bs['listed'] += 1
+        for s in srcs:
+            by_source[s] = by_source.get(s, 0) + 1
+        if fld:
+            if first_ever is None or fld < first_ever:
+                first_ever = fld
+            if latest_add is None or fld > latest_add:
+                latest_add = fld
+
+    summary = {
+        'total': len(out),
+        'listed': listed,
+        'delisted': delisted,
+        'by_sku': by_sku,
+        'by_source': by_source,
+        'first_ever': first_ever,
+        'latest_add': latest_add,
+    }
+    return jsonify({'count': len(out), 'rows': out, 'summary': summary,
+                    'as_of': today.isoformat()})
+
+
+@app.route('/api/listings/added', methods=['GET'])
+@cached_response(ttl_seconds=120, key_args=('since', 'days', 'sku'))
+def api_listings_added():
+    """THE tracking feature: every LISTED event in the window straight from the
+    immutable ledger, newest first, with source + store enrichment.
+
+    Answers "what listings were added over the last X days" from the LEDGER,
+    not from a live SOD read — so it still works even if SOD is down.
+    ?since=YYYY-MM-DD (or ?days=, default 30).
+    """
+    _ensure_listing_ledger(get_db())
+    from datetime import date as _date
+    since_arg = (request.args.get('since') or '').strip()
+    if since_arg:
+        try:
+            _date.fromisoformat(since_arg)
+            since = since_arg
+        except ValueError:
+            since = (_toronto_today() - timedelta(days=30)).isoformat()
+    else:
+        days = _safe_int_arg('days', 30)
+        since = (_toronto_today() - timedelta(days=days)).isoformat()
+
+    sku_arg = (request.args.get('sku') or '').strip()
+    sku_pad = _pad_sku(sku_arg) if sku_arg else None
+    directory = _stores_directory()
+
+    params = [since]
+    sku_clause = ""
+    if sku_pad:
+        sku_clause = "AND sku = ? "
+        params.append(sku_pad)
+    rows = db_fetchall(
+        "SELECT id, sku, store_number, source, source_detail, "
+        "CAST(observed_date AS TEXT) AS observed_date, "
+        "CAST(recorded_at AS TEXT) AS recorded_at, note "
+        "FROM listing_ledger WHERE event='LISTED' AND observed_date >= ? "
+        f"{sku_clause}"
+        "ORDER BY observed_date DESC, id DESC", params)
+
+    out = []
+    by_source = {}
+    for r in rows:
+        d = row_to_dict(r)
+        sn = int(d['store_number'])
+        dinfo = directory.get(sn) or {}
+        out.append({
+            'sku': d['sku'],
+            'brand': _ledger_brand(d['sku']),
+            'product_name': _ledger_product(d['sku']),
+            'store_number': sn,
+            'account': dinfo.get('account'),
+            'city': dinfo.get('city'),
+            'source': d['source'],
+            'source_detail': d['source_detail'],
+            'observed_date': d['observed_date'],
+            'recorded_at': d['recorded_at'],
+            'note': d['note'],
+        })
+        by_source[d['source']] = by_source.get(d['source'], 0) + 1
+
+    summary = {
+        'count': len(out),
+        'by_source': by_source,
+    }
+    return jsonify({'since': since, 'count': len(out), 'rows': out,
+                    'summary': summary})
+
+
+@app.route('/api/listings/store/<int:store_number>', methods=['GET'])
+def api_listings_store(store_number):
+    """Per-store FULL ledger timeline — every event, every source, newest
+    first — plus the current materialized state for that store."""
+    _ensure_listing_ledger(get_db())
+    sn = int(store_number)
+    directory = _stores_directory()
+    dinfo = directory.get(sn) or {}
+    events = []
+    for r in db_fetchall(
+        "SELECT sku, event, source, source_detail, "
+        "CAST(observed_date AS TEXT) AS observed_date, "
+        "CAST(recorded_at AS TEXT) AS recorded_at, note "
+        "FROM listing_ledger WHERE store_number = ? "
+        "ORDER BY observed_date DESC, id DESC", (sn,)):
+        d = row_to_dict(r)
+        events.append({
+            'sku': d['sku'],
+            'brand': _ledger_brand(d['sku']),
+            'product_name': _ledger_product(d['sku']),
+            'event': d['event'],
+            'source': d['source'],
+            'source_detail': d['source_detail'],
+            'observed_date': d['observed_date'],
+            'recorded_at': d['recorded_at'],
+            'note': d['note'],
+        })
+    current = []
+    today = _toronto_today()
+    for r in db_fetchall(
+        "SELECT sku, status, "
+        "CAST(first_listed_date AS TEXT) AS first_listed_date, "
+        "CAST(last_confirmed_date AS TEXT) AS last_confirmed_date, "
+        "CAST(delisted_date AS TEXT) AS delisted_date, "
+        "sources_seen, confirm_count "
+        "FROM store_listings WHERE store_number = ? ORDER BY sku", (sn,)):
+        d = row_to_dict(r)
+        current.append({
+            'sku': d['sku'],
+            'brand': _ledger_brand(d['sku']),
+            'product_name': _ledger_product(d['sku']),
+            'status': d['status'],
+            'first_listed_date': d['first_listed_date'],
+            'last_confirmed_date': d['last_confirmed_date'],
+            'delisted_date': d['delisted_date'],
+            'sources_seen': d['sources_seen'],
+            'confirm_count': d['confirm_count'],
+            'days_since_confirmed': _days_between(today, d['last_confirmed_date']),
+        })
+    return jsonify({
+        'store_number': sn,
+        'account': dinfo.get('account'),
+        'city': dinfo.get('city'),
+        'current': current,
+        'events': events,
+        'event_count': len(events),
+    })
+
+
+@app.route('/api/listings/ledger', methods=['GET'])
+def api_listings_ledger():
+    """The raw immutable event stream (audit / debug view). ?sku= filters to a
+    SKU; ?days= limits the observed_date window (default 90)."""
+    _ensure_listing_ledger(get_db())
+    sku_arg = (request.args.get('sku') or '').strip()
+    sku_pad = _pad_sku(sku_arg) if sku_arg else None
+    days = _safe_int_arg('days', 90)
+    since = (_toronto_today() - timedelta(days=days)).isoformat()
+    params = [since]
+    sku_clause = ""
+    if sku_pad:
+        sku_clause = "AND sku = ? "
+        params.append(sku_pad)
+    rows = db_fetchall(
+        "SELECT id, sku, store_number, event, source, source_detail, "
+        "CAST(observed_date AS TEXT) AS observed_date, "
+        "CAST(recorded_at AS TEXT) AS recorded_at, note "
+        "FROM listing_ledger WHERE observed_date >= ? "
+        f"{sku_clause}"
+        "ORDER BY observed_date DESC, id DESC LIMIT 5000", params)
+    out = []
+    by_event = {}
+    for r in rows:
+        d = row_to_dict(r)
+        out.append({
+            'id': d['id'],
+            'sku': d['sku'],
+            'brand': _ledger_brand(d['sku']),
+            'store_number': int(d['store_number']),
+            'event': d['event'],
+            'source': d['source'],
+            'source_detail': d['source_detail'],
+            'observed_date': d['observed_date'],
+            'recorded_at': d['recorded_at'],
+            'note': d['note'],
+        })
+        by_event[d['event']] = by_event.get(d['event'], 0) + 1
+    return jsonify({'days': days, 'since': since, 'count': len(out),
+                    'rows': out, 'by_event': by_event})
+
+
+@app.route('/api/listings/source-health', methods=['GET'])
+@require_app_origin
+def api_listings_source_health():
+    """Per-source freshness of the ledger — last observed_date, last write, and
+    rows in the last 7 days — so a stale or LOST source (SOD or live gone dark)
+    is visible early. This is the early-warning that a feed is failing."""
+    _ensure_listing_ledger(get_db())
+    today = _toronto_today()
+    since7 = (today - timedelta(days=7)).isoformat()
+    agg = {}
+    for r in db_fetchall(
+        "SELECT source, CAST(MAX(observed_date) AS TEXT) AS last_observed, "
+        "CAST(MAX(recorded_at) AS TEXT) AS last_recorded, COUNT(*) AS total_rows "
+        "FROM listing_ledger GROUP BY source"):
+        d = row_to_dict(r)
+        agg[d['source']] = {
+            'last_observed_date': d['last_observed'],
+            'last_recorded_at': d['last_recorded'],
+            'total_rows': int(d['total_rows'] or 0),
+            'rows_last_7d': 0,
+        }
+    for r in db_fetchall(
+        "SELECT source, COUNT(*) AS n FROM listing_ledger "
+        "WHERE observed_date >= ? GROUP BY source", (since7,)):
+        d = row_to_dict(r)
+        if d['source'] in agg:
+            agg[d['source']]['rows_last_7d'] = int(d['n'] or 0)
+
+    # Feeds we expect to keep flowing. sod/live are automated (stale > 2 days is
+    # an alert); rep/manual are ad-hoc, so their silence is not a failure.
+    AUTOMATED = {'sod', 'live'}
+    sources = []
+    for src in sorted(set(list(agg.keys()) + ['sod', 'live', 'rep', 'manual'])):
+        info = agg.get(src, {
+            'last_observed_date': None, 'last_recorded_at': None,
+            'total_rows': 0, 'rows_last_7d': 0})
+        age = _days_between(today, info['last_observed_date'])
+        info['source'] = src
+        info['days_since_last_observed'] = age
+        info['is_stale'] = bool(
+            src in AUTOMATED and (info['total_rows'] > 0)
+            and (age is None or age > 2))
+        info['present'] = info['total_rows'] > 0
+        sources.append(info)
+
+    stale = [s['source'] for s in sources if s['is_stale']]
+    return jsonify({
+        'as_of': today.isoformat(),
+        'sources': sources,
+        'any_stale': bool(stale),
+        'stale_sources': stale,
+    })
+
+
+@app.route('/api/export/listings.xlsx')
+def api_export_listings_xlsx():
+    """Canonical listings download — the materialized state with source badges
+    and first-listed dates (openpyxl is already in requirements)."""
+    data = _api_json('api_listings')
+    headers = ['SKU', 'Brand', 'Product', 'Store #', 'Account', 'City',
+               'Status', 'First Listed', 'Last Confirmed', 'Delisted',
+               'Sources Seen', 'Confirmations', 'Days Since Confirmed']
+    rows = [[r.get('sku'), r.get('brand'), r.get('product_name'),
+             r.get('store_number'), r.get('account'), r.get('city'),
+             r.get('status'), r.get('first_listed_date'),
+             r.get('last_confirmed_date'), r.get('delisted_date'),
+             r.get('sources_seen'), r.get('confirm_count'),
+             r.get('days_since_confirmed')]
+            for r in data.get('rows', [])]
+    return _xlsx_response(
+        f'anu_listings_{_toronto_today().isoformat()}.xlsx',
+        'Listings', headers, rows)
 
 
 # ---------------------------------------------------------------------------
