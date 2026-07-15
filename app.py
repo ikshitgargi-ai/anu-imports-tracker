@@ -8040,9 +8040,13 @@ def api_horeca_prospects():
 
     region_rank = ("CASE region WHEN 'core' THEN 0 WHEN 'gtha' THEN 1 "
                    "ELSE 2 END")
+    if request.args.get('has_phone', '').lower() in ('1', 'true', 'yes'):
+        where.append("COALESCE(phone,'') != ''")
     rows = db_fetchall(
         f"SELECT licence_number, name, address, city, postal, licence_type, "
-        f"status, region, kind, name_count, is_independent, matched_account_id "
+        f"status, region, kind, name_count, is_independent, matched_account_id, "
+        f"COALESCE(phone,''), COALESCE(website,''), COALESCE(lat,0), "
+        f"COALESCE(lng,0) "
         f"FROM agco_licensees WHERE {' AND '.join(where)} "
         f"ORDER BY (matched_account_id IS NULL) DESC, is_independent DESC, "
         f"{region_rank}, city, name LIMIT {limit} OFFSET {offset}",
@@ -8058,7 +8062,431 @@ def api_horeca_prospects():
             'city': r[3], 'postal': r[4], 'licence_type': r[5],
             'status': r[6], 'region': r[7], 'kind': r[8],
             'locations': r[9], 'is_independent': bool(r[10]),
-            'matched_account_id': r[11], **links,
+            'matched_account_id': r[11],
+            'phone': r[12], 'website': r[13],
+            'lat': r[14], 'lng': r[15], **links,
+        })
+    return jsonify({'count': total, 'rows': out, 'limit': limit,
+                    'offset': offset})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GTHA SWEEP — harvest EVERY food/drink venue in the Greater Toronto + Hamilton
+# Area from OpenStreetMap (Overpass), street by street, then cross-reference to
+# the AGCO licensee universe. OSM is free and ODbL-licensed (storable for
+# internal prospecting with attribution). The sweep enriches the 18k AGCO
+# licence records — which carry NO phone/website/coords — with contactable,
+# mappable detail, and confirms which mapped venues actually hold a liquor
+# licence (the only real targets for a liquor agency). Google Maps / Yelp are
+# reached via per-venue deep links only (their ToS forbids storing their data
+# in a CRM); this sweep is the compliant way to get the coverage.
+#
+# Resumable by design: a tile grid with per-tile status, drained N tiles per
+# call, so no single request hangs and a killed run loses nothing.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_GTHA_SWEEP_READY = False
+
+# GTHA bounding box (S, W, N, E). Covers Hamilton in the SW to Bowmanville in
+# the E, lake shore up to the Bradford/Barrie edge.
+_GTHA_BBOX = (43.30, -80.30, 44.05, -78.85)
+_GTHA_TILE_DEG = 0.05  # ~5.5 km lat, ~4 km lng at this latitude
+
+# On-premise-liquor amenities (what a licensed venue looks like on the map).
+_SWEEP_CATEGORIES = ('bar', 'pub', 'restaurant', 'nightclub', 'biergarten',
+                     'cafe', 'fast_food', 'food_court')
+
+
+def _ensure_gtha_sweep(db):
+    """Idempotent DDL for the sweep tables + AGCO enrichment columns."""
+    global _GTHA_SWEEP_READY
+    if _GTHA_SWEEP_READY:
+        return
+    pk = 'BIGSERIAL PRIMARY KEY' if USE_POSTGRES else 'INTEGER PRIMARY KEY AUTOINCREMENT'
+    stmts = [
+        '''CREATE TABLE IF NOT EXISTS osm_sweep_tiles (
+               tile_key TEXT PRIMARY KEY,
+               south REAL, west REAL, north REAL, east REAL,
+               status TEXT DEFAULT 'pending',
+               venue_count INTEGER DEFAULT 0,
+               error TEXT DEFAULT '',
+               swept_at TIMESTAMP)''',
+        '''CREATE TABLE IF NOT EXISTS osm_venues (
+               osm_id TEXT PRIMARY KEY,
+               name TEXT NOT NULL,
+               kind TEXT DEFAULT '',
+               address TEXT DEFAULT '',
+               city TEXT DEFAULT '',
+               postal TEXT DEFAULT '',
+               lat REAL DEFAULT 0,
+               lng REAL DEFAULT 0,
+               phone TEXT DEFAULT '',
+               website TEXT DEFAULT '',
+               cuisine TEXT DEFAULT '',
+               opening_hours TEXT DEFAULT '',
+               region TEXT DEFAULT 'other',
+               matched_licence TEXT DEFAULT '',
+               first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
+        'CREATE INDEX IF NOT EXISTS idx_osmv_city ON osm_venues(city)',
+        'CREATE INDEX IF NOT EXISTS idx_osmv_name ON osm_venues(name)',
+        'CREATE INDEX IF NOT EXISTS idx_sweep_status ON osm_sweep_tiles(status)',
+    ]
+    # AGCO + book enrichment columns (contact detail OSM supplies).
+    alters = [
+        ('agco_licensees', 'phone', "TEXT DEFAULT ''"),
+        ('agco_licensees', 'website', "TEXT DEFAULT ''"),
+        ('agco_licensees', 'lat', 'REAL DEFAULT 0'),
+        ('agco_licensees', 'lng', 'REAL DEFAULT 0'),
+        ('agco_licensees', 'cuisine', "TEXT DEFAULT ''"),
+        ('agco_licensees', 'osm_id', "TEXT DEFAULT ''"),
+        ('agco_licensees', 'enriched_at', 'TIMESTAMP'),
+        ('horeca_accounts', 'lat', 'REAL DEFAULT 0'),
+        ('horeca_accounts', 'lng', 'REAL DEFAULT 0'),
+    ]
+    if USE_POSTGRES:
+        cur = db.cursor()
+        for s in stmts:
+            cur.execute(s)
+        for t, c, ctype in alters:
+            try:
+                cur.execute(f'ALTER TABLE {t} ADD COLUMN IF NOT EXISTS {c} {ctype}')
+                db.commit()
+            except Exception:
+                db.rollback()
+        db.commit()
+        cur.close()
+    else:
+        for s in stmts:
+            db.execute(s)
+        for t, c, ctype in alters:
+            try:
+                db.execute(f'ALTER TABLE {t} ADD COLUMN {c} {ctype}')
+            except Exception:
+                pass
+        db.commit()
+    _GTHA_SWEEP_READY = True
+
+
+def _gtha_tiles():
+    """Yield (tile_key, s, w, n, e) covering the GTHA grid."""
+    s0, w0, n0, e0 = _GTHA_BBOX
+    step = _GTHA_TILE_DEG
+    r = 0
+    lat = s0
+    while lat < n0 - 1e-9:
+        c = 0
+        lng = w0
+        while lng < e0 - 1e-9:
+            yield (f'{r:02d}_{c:02d}', round(lat, 4), round(lng, 4),
+                   round(min(lat + step, n0), 4), round(min(lng + step, e0), 4))
+            c += 1
+            lng += step
+        r += 1
+        lat += step
+
+
+def _overpass_sweep_tile(bbox):
+    """All named on-premise-liquor amenities in a tile (no artificial cap).
+    Returns (elements, error). Backs off once on 429/504."""
+    if http_requests is None:
+        return [], 'requests unavailable'
+    south, west, north, east = bbox
+    cats = '|'.join(_SWEEP_CATEGORIES)
+    q = (f'[out:json][timeout:80];'
+         f'nwr["amenity"~"^({cats})$"]["name"]({south},{west},{north},{east});'
+         f'out center tags;')
+    for attempt in (1, 2):
+        try:
+            resp = http_requests.post(
+                _OVERPASS_URL, data={'data': q},
+                headers={'User-Agent': _PROSPECT_UA}, timeout=100)
+            if resp.status_code in (429, 504) and attempt == 1:
+                time.sleep(30)
+                continue
+            resp.raise_for_status()
+            return (resp.json() or {}).get('elements', []), ''
+        except Exception as e:
+            if attempt == 1:
+                time.sleep(15)
+            else:
+                return [], str(e)[:200]
+    return [], 'exhausted retries'
+
+
+@app.route('/api/horeca/sweep/plan', methods=['POST'])
+@require_app_origin
+def api_horeca_sweep_plan():
+    """Lay down (or top up) the GTHA tile grid. Idempotent."""
+    db = get_db()
+    _ensure_gtha_sweep(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    have = {r[0] for r in db_fetchall('SELECT tile_key FROM osm_sweep_tiles')}
+    cur = db.cursor() if USE_POSTGRES else db
+    added = 0
+    for key, s, w, n, e in _gtha_tiles():
+        if key in have:
+            continue
+        cur.execute(
+            f"INSERT INTO osm_sweep_tiles (tile_key, south, west, north, east) "
+            f"VALUES ({ph},{ph},{ph},{ph},{ph})", (key, s, w, n, e))
+        added += 1
+    db.commit()
+    if USE_POSTGRES:
+        cur.close()
+    total = db_fetchall('SELECT COUNT(*) FROM osm_sweep_tiles')[0][0]
+    return jsonify({'status': 'ok', 'tiles_added': added, 'tiles_total': total,
+                    'bbox': _GTHA_BBOX, 'tile_deg': _GTHA_TILE_DEG})
+
+
+@app.route('/api/horeca/sweep/run', methods=['POST'])
+@require_app_origin
+def api_horeca_sweep_run():
+    """Drain up to `tiles` pending tiles (default 6) through Overpass, upsert
+    every venue into osm_venues. Polite: a short pause between tiles. Call
+    repeatedly until pending hits 0 — each call is short enough to dodge the
+    proxy timeout and a killed call re-runs its tiles safely."""
+    data = request.get_json(silent=True) or {}
+    n_tiles = max(1, min(int(data.get('tiles') or 6), 20))
+    db = get_db()
+    _ensure_gtha_sweep(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    pend = db_fetchall(
+        f"SELECT tile_key, south, west, north, east FROM osm_sweep_tiles "
+        f"WHERE status IN ('pending','error') ORDER BY status DESC, tile_key "
+        f"LIMIT {n_tiles}")
+    swept = venues_new = venues_seen = 0
+    for key, s, w, n, e in pend:
+        elements, err = _overpass_sweep_tile((s, w, n, e))
+        if err:
+            db.execute(
+                f"UPDATE osm_sweep_tiles SET status='error', error={ph}, "
+                f"swept_at=CURRENT_TIMESTAMP WHERE tile_key={ph}", (err, key))
+            db.commit()
+            continue
+        cnt = 0
+        cur = db.cursor() if USE_POSTGRES else db
+        for el in elements:
+            v = _normalize_overpass_element(el)
+            if not v or not v.get('osm_id'):
+                continue
+            region = _horeca_region(v['city'])
+            if USE_POSTGRES:
+                cur.execute(
+                    "INSERT INTO osm_venues (osm_id, name, kind, address, city, "
+                    "postal, lat, lng, phone, website, cuisine, opening_hours, "
+                    "region, last_seen) VALUES "
+                    "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,CURRENT_TIMESTAMP) "
+                    "ON CONFLICT (osm_id) DO UPDATE SET name=excluded.name, "
+                    "kind=excluded.kind, address=excluded.address, "
+                    "city=excluded.city, postal=excluded.postal, "
+                    "lat=excluded.lat, lng=excluded.lng, phone=excluded.phone, "
+                    "website=excluded.website, cuisine=excluded.cuisine, "
+                    "region=excluded.region, last_seen=CURRENT_TIMESTAMP",
+                    (v['osm_id'], v['name'], v['account_type'], v['address'],
+                     v['city'], v['postal'], v['lat'], v['lng'], v['phone'],
+                     v['website'], v['cuisine'],
+                     (el.get('tags') or {}).get('opening_hours', ''), region))
+            else:
+                cur.execute(
+                    "INSERT OR REPLACE INTO osm_venues (osm_id, name, kind, "
+                    "address, city, postal, lat, lng, phone, website, cuisine, "
+                    "opening_hours, region, last_seen) VALUES "
+                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                    (v['osm_id'], v['name'], v['account_type'], v['address'],
+                     v['city'], v['postal'], v['lat'], v['lng'], v['phone'],
+                     v['website'], v['cuisine'],
+                     (el.get('tags') or {}).get('opening_hours', ''), region))
+            cnt += 1
+        db.commit()
+        if USE_POSTGRES:
+            cur.close()
+        db.execute(
+            f"UPDATE osm_sweep_tiles SET status='done', venue_count={ph}, "
+            f"error='', swept_at=CURRENT_TIMESTAMP WHERE tile_key={ph}",
+            (cnt, key))
+        db.commit()
+        swept += 1
+        venues_seen += cnt
+        time.sleep(2)  # Overpass etiquette between tiles
+    prog = db_fetchall(
+        "SELECT status, COUNT(*) FROM osm_sweep_tiles GROUP BY status")
+    by_status = {r[0]: r[1] for r in prog}
+    total_v = db_fetchall('SELECT COUNT(*) FROM osm_venues')[0][0]
+    return jsonify({
+        'status': 'ok', 'tiles_swept_this_run': swept,
+        'venues_seen_this_run': venues_seen, 'venues_total': total_v,
+        'tiles': by_status,
+        'pending': by_status.get('pending', 0) + by_status.get('error', 0),
+    })
+
+
+@app.route('/api/horeca/sweep/status', methods=['GET'])
+def api_horeca_sweep_status():
+    db = get_db()
+    _ensure_gtha_sweep(db)
+    prog = {r[0]: r[1] for r in db_fetchall(
+        "SELECT status, COUNT(*) FROM osm_sweep_tiles GROUP BY status")}
+    total_v = db_fetchall('SELECT COUNT(*) FROM osm_venues')[0][0]
+    matched_v = db_fetchall(
+        "SELECT COUNT(*) FROM osm_venues WHERE matched_licence != ''")[0][0]
+    enriched = db_fetchall(
+        "SELECT COUNT(*) FROM agco_licensees WHERE COALESCE(enriched_at::text,'') != ''"
+        if USE_POSTGRES else
+        "SELECT COUNT(*) FROM agco_licensees WHERE COALESCE(enriched_at,'') != ''")[0][0]
+    return jsonify({
+        'tiles': prog,
+        'tiles_total': sum(prog.values()),
+        'tiles_done': prog.get('done', 0),
+        'venues_total': total_v,
+        'venues_matched_to_licence': matched_v,
+        'licensees_enriched': enriched,
+        'bbox': _GTHA_BBOX,
+    })
+
+
+@app.route('/api/horeca/enrich', methods=['POST'])
+@require_app_origin
+def api_horeca_enrich():
+    """Cross-reference: match OSM venues to AGCO licensees (and the book) by
+    normalized name + city, then stamp phone / website / coords into BLANK
+    fields only (never overwrite verified data), and mark which mapped venues
+    hold a licence. This turns 18k bare licence rows into contactable leads."""
+    db = get_db()
+    _ensure_gtha_sweep(db)
+    _ensure_horeca_v2(db)
+    ph = '%s' if USE_POSTGRES else '?'
+
+    # Index OSM venues that carry something worth copying, by (norm-name, city).
+    venues = db_fetchall(
+        "SELECT osm_id, name, city, phone, website, lat, lng, cuisine "
+        "FROM osm_venues")
+    by_key = {}
+    for osm_id, name, city, phone, website, lat, lng, cuisine in venues:
+        key = (_horeca_norm_name(name), (city or '').strip().lower())
+        # Prefer a venue that actually has contact detail.
+        score = (1 if phone else 0) + (1 if website else 0) + (1 if lat else 0)
+        cur_best = by_key.get(key)
+        if cur_best is None or score > cur_best[0]:
+            by_key[key] = (score, osm_id, phone or '', website or '',
+                           lat or 0, lng or 0, cuisine or '')
+
+    # Enrich AGCO licensees.
+    lic = db_fetchall(
+        "SELECT licence_number, name, city, COALESCE(phone,''), "
+        "COALESCE(website,''), COALESCE(lat,0), COALESCE(lng,0) "
+        "FROM agco_licensees")
+    lic_updates = []
+    matched_licences = []
+    for licnum, name, city, phone, website, lat, lng in lic:
+        key = (_horeca_norm_name(name), (city or '').strip().lower())
+        hit = by_key.get(key)
+        if not hit:
+            continue
+        _, osm_id, ophone, owebsite, olat, olng, ocuisine = hit
+        matched_licences.append((licnum, osm_id))
+        new_phone = phone or ophone
+        new_web = website or owebsite
+        new_lat = lat or olat
+        new_lng = lng or olng
+        if (new_phone, new_web, new_lat, new_lng) == (phone, website, lat, lng):
+            continue  # nothing blank to fill
+        lic_updates.append((new_phone, new_web, new_lat, new_lng, ocuisine,
+                            osm_id, licnum))
+
+    cur = db.cursor() if USE_POSTGRES else db
+    for i in range(0, len(lic_updates), 500):
+        for u in lic_updates[i:i + 500]:
+            cur.execute(
+                f"UPDATE agco_licensees SET phone={ph}, website={ph}, lat={ph}, "
+                f"lng={ph}, cuisine={ph}, osm_id={ph}, "
+                f"enriched_at=CURRENT_TIMESTAMP WHERE licence_number={ph}", u)
+        db.commit()
+    # Mark matched venues (which mapped venues are licensed = real targets).
+    for i in range(0, len(matched_licences), 500):
+        for licnum, osm_id in matched_licences[i:i + 500]:
+            cur.execute(
+                f"UPDATE osm_venues SET matched_licence={ph} WHERE osm_id={ph}",
+                (licnum, osm_id))
+        db.commit()
+
+    # Enrich the field book (horeca_accounts) coords/phone where blank.
+    book = db_fetchall(
+        "SELECT id, name, city, COALESCE(phone,''), COALESCE(lat,0), "
+        "COALESCE(lng,0) FROM horeca_accounts")
+    book_updates = 0
+    for hid, name, city, phone, lat, lng in book:
+        hit = by_key.get((_horeca_norm_name(name), (city or '').strip().lower()))
+        if not hit:
+            continue
+        _, osm_id, ophone, owebsite, olat, olng, ocuisine = hit
+        np, nlat, nlng = phone or ophone, lat or olat, lng or olng
+        if (np, nlat, nlng) == (phone, lat, lng):
+            continue
+        cur.execute(
+            f"UPDATE horeca_accounts SET phone={ph}, lat={ph}, lng={ph}, "
+            f"updated_at=CURRENT_TIMESTAMP WHERE id={ph}",
+            (np, nlat, nlng, hid))
+        book_updates += 1
+    db.commit()
+    if USE_POSTGRES:
+        cur.close()
+
+    return jsonify({
+        'status': 'ok',
+        'osm_venues': len(venues),
+        'licensees_matched': len(matched_licences),
+        'licensees_enriched': len(lic_updates),
+        'book_accounts_enriched': book_updates,
+    })
+
+
+@app.route('/api/horeca/venues', methods=['GET'])
+def api_horeca_venues():
+    """Browse the harvested OSM venue universe. Filters: q, city, region,
+    kind, licensed=1 (only those matched to an AGCO licence), has_phone=1."""
+    db = get_db()
+    _ensure_gtha_sweep(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    where, params = ['1=1'], []
+    q = (request.args.get('q') or '').strip()
+    if q:
+        where.append(f'LOWER(name) LIKE {ph}')
+        params.append(f'%{q.lower()}%')
+    city = (request.args.get('city') or '').strip()
+    if city:
+        where.append(f'LOWER(city) = {ph}')
+        params.append(city.lower())
+    region = (request.args.get('region') or '').strip().lower()
+    if region in ('core', 'gtha', 'other'):
+        where.append(f'region = {ph}')
+        params.append(region)
+    kind = (request.args.get('kind') or '').strip().lower()
+    if kind:
+        where.append(f'kind = {ph}')
+        params.append(kind)
+    if request.args.get('licensed', '').lower() in ('1', 'true', 'yes'):
+        where.append("matched_licence != ''")
+    if request.args.get('has_phone', '').lower() in ('1', 'true', 'yes'):
+        where.append("phone != ''")
+    limit = max(1, min(request.args.get('limit', default=50, type=int), 200))
+    offset = max(0, request.args.get('offset', default=0, type=int))
+    rows = db_fetchall(
+        f"SELECT osm_id, name, kind, address, city, postal, lat, lng, phone, "
+        f"website, cuisine, region, matched_licence FROM osm_venues "
+        f"WHERE {' AND '.join(where)} ORDER BY (matched_licence != '') DESC, "
+        f"(phone != '') DESC, city, name LIMIT {limit} OFFSET {offset}", params)
+    total = db_fetchall(
+        f"SELECT COUNT(*) FROM osm_venues WHERE {' AND '.join(where)}",
+        params)[0][0]
+    out = []
+    for r in rows:
+        out.append({
+            'osm_id': r[0], 'name': r[1], 'kind': r[2], 'address': r[3],
+            'city': r[4], 'postal': r[5], 'lat': r[6], 'lng': r[7],
+            'phone': r[8], 'website': r[9], 'cuisine': r[10], 'region': r[11],
+            'licensed': bool(r[12]), 'matched_licence': r[12],
+            **_venue_links(r[1], r[3], r[4]),
         })
     return jsonify({'count': total, 'rows': out, 'limit': limit,
                     'offset': offset})
@@ -8587,6 +9015,8 @@ _EXPORT_TABLES = [
     # backup too; the export tolerates their absence until first use).
     ('agco_licensees',             'licence_number'),
     ('horeca_activities',          'id'),
+    ('osm_venues',                 'osm_id'),
+    ('osm_sweep_tiles',            'tile_key'),
     ('lcbo_live_batches',          'id'),
     ('lcbo_live_snapshots',        'id'),
     ('live_listing_events',        'id'),
