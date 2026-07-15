@@ -962,6 +962,13 @@ def init_db():
             ('horeca_accounts', 'source', "TEXT DEFAULT 'manual'"),
             ('horeca_accounts', 'licence_no', "TEXT DEFAULT ''"),
             ('horeca_accounts', 'osm_id', "TEXT DEFAULT ''"),
+            # HORECA CRM v2 — Sales Agency OS doc-09 extensions
+            ('horeca_accounts', 'licence_sale_no', "TEXT DEFAULT ''"),
+            ('horeca_accounts', 'scheme', "TEXT DEFAULT ''"),
+            ('horeca_accounts', 'wants_cocktail_menu', "INTEGER DEFAULT 0"),
+            ('deals', 'cases', "INTEGER DEFAULT 0"),
+            ('deals', 'lcbo_store_number', "INTEGER"),
+            ('deals', 'licence_sale_no', "TEXT DEFAULT ''"),
         ]
         for table, col, coltype in crm_migrate_cols:
             try:
@@ -1429,6 +1436,13 @@ def init_db():
             ('horeca_accounts', 'source', "TEXT DEFAULT 'manual'"),
             ('horeca_accounts', 'licence_no', "TEXT DEFAULT ''"),
             ('horeca_accounts', 'osm_id', "TEXT DEFAULT ''"),
+            # HORECA CRM v2 — Sales Agency OS doc-09 extensions
+            ('horeca_accounts', 'licence_sale_no', "TEXT DEFAULT ''"),
+            ('horeca_accounts', 'scheme', "TEXT DEFAULT ''"),
+            ('horeca_accounts', 'wants_cocktail_menu', "INTEGER DEFAULT 0"),
+            ('deals', 'cases', "INTEGER DEFAULT 0"),
+            ('deals', 'lcbo_store_number', "INTEGER"),
+            ('deals', 'licence_sale_no', "TEXT DEFAULT ''"),
         ]
         for table, col, coltype in migrate_cols:
             try:
@@ -7649,6 +7663,664 @@ def api_horeca_prospect_agco():
 
 
 # ------- Unified store detail (SOD + live LCBO.com) -------
+# ═══════════════════════════════════════════════════════════════════════════
+# HORECA CRM v2 — the intensive on-trade engine (Sales Agency OS docs 01/03/09)
+# Universe: every active AGCO liquor sales licensee in Ontario (open data,
+# OGL-Ontario). Book: the field-built account list. Orders live on `deals`
+# (stage='ordered'); the venue ALWAYS buys through the LCBO on its own licence
+# — these records track the relationship, never a direct sale.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_HORECA_V2_READY = False
+
+_HORECA_CORE_CITIES = frozenset((
+    'toronto', 'north york', 'scarborough', 'etobicoke', 'york', 'east york',
+))
+_HORECA_GTHA_CITIES = frozenset((
+    'mississauga', 'brampton', 'hamilton', 'vaughan', 'woodbridge', 'concord',
+    'maple', 'kleinburg', 'thornhill', 'markham', 'richmond hill', 'oakville',
+    'burlington', 'milton', 'ajax', 'pickering', 'whitby', 'oshawa', 'aurora',
+    'newmarket', 'king city', 'stouffville', 'whitchurch-stouffville',
+    'georgetown', 'halton hills', 'stoney creek', 'ancaster', 'dundas',
+    'waterdown', 'caledon', 'bolton', 'malton', 'streetsville', 'port credit',
+    'unionville', 'courtice', 'bowmanville', 'uxbridge', 'nobleton',
+))
+
+_AGCO_KIND_PATTERNS = (
+    ('club', ('night club', 'nightclub', ' club', 'lounge', 'disco')),
+    ('bar', (' bar', 'pub ', ' pub', 'tavern', 'brewpub', 'taproom',
+             'brewhouse', 'wine bar', 'cocktail')),
+    ('hotel', ('hotel', ' inn', 'motel', 'resort', 'suites')),
+    ('banquet', ('banquet', 'convention', 'event centre', 'event center',
+                 'hall', 'catering')),
+    ('restaurant', ('restaurant', 'resto', 'grill', 'bistro', 'eatery',
+                    'kitchen', 'cuisine', 'pizzeria', 'diner', 'cafe',
+                    'caffe', 'sushi', 'bbq', 'steakhouse', 'shawarma',
+                    'trattoria', 'cantina', 'izakaya')),
+)
+
+
+def _horeca_region(city):
+    c = (city or '').strip().lower()
+    if c in _HORECA_CORE_CITIES:
+        return 'core'
+    if c in _HORECA_GTHA_CITIES:
+        return 'gtha'
+    return 'other'
+
+
+def _agco_kind(name):
+    n = ' ' + (name or '').lower() + ' '
+    for kind, pats in _AGCO_KIND_PATTERNS:
+        for p in pats:
+            if p in n:
+                return kind
+    return 'other'
+
+
+def _horeca_norm_name(s):
+    """Normalize a venue name for dedupe/chain detection: lowercase,
+    alphanumerics only, common corporate/venue suffixes dropped."""
+    import re as _re
+    n = _re.sub(r'[^a-z0-9 ]+', ' ', (s or '').lower())
+    drop = {'the', 'inc', 'ltd', 'limited', 'corp', 'restaurant', 'resto',
+            'bar', 'grill', 'and', 'of', 'co'}
+    words = [w for w in n.split() if w not in drop]
+    return ' '.join(words) if words else n.strip()
+
+
+def _venue_links(name, address, city):
+    from urllib.parse import quote_plus
+    q = quote_plus(' '.join(x for x in (name, address, city, 'Ontario') if x))
+    return {
+        'google_maps_url': f'https://www.google.com/maps/search/?api=1&query={q}',
+        'yelp_url': ('https://www.yelp.ca/search?find_desc='
+                     f"{quote_plus(name or '')}&find_loc={quote_plus((city or 'Toronto') + ', ON')}"),
+    }
+
+
+def _ensure_horeca_v2(db):
+    """Idempotent DDL for the v2 tables (both engines). Never destructive."""
+    global _HORECA_V2_READY
+    if _HORECA_V2_READY:
+        return
+    pk = 'BIGSERIAL PRIMARY KEY' if USE_POSTGRES else 'INTEGER PRIMARY KEY AUTOINCREMENT'
+    stmts = [
+        '''CREATE TABLE IF NOT EXISTS agco_licensees (
+               licence_number TEXT PRIMARY KEY,
+               name TEXT NOT NULL,
+               address TEXT DEFAULT '',
+               city TEXT DEFAULT '',
+               postal TEXT DEFAULT '',
+               licence_type TEXT DEFAULT '',
+               status TEXT DEFAULT '',
+               region TEXT DEFAULT 'other',
+               kind TEXT DEFAULT 'other',
+               name_count INTEGER DEFAULT 1,
+               is_independent INTEGER DEFAULT 1,
+               matched_account_id INTEGER,
+               first_seen DATE,
+               last_seen DATE,
+               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
+        f'''CREATE TABLE IF NOT EXISTS horeca_activities (
+               id {pk},
+               horeca_account_id INTEGER NOT NULL,
+               rep TEXT DEFAULT '',
+               activity_type TEXT DEFAULT 'visit',
+               notes TEXT DEFAULT '',
+               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
+        'CREATE INDEX IF NOT EXISTS idx_agco_city ON agco_licensees(city)',
+        'CREATE INDEX IF NOT EXISTS idx_agco_region ON agco_licensees(region)',
+        'CREATE INDEX IF NOT EXISTS idx_agco_norm ON agco_licensees(name)',
+        'CREATE INDEX IF NOT EXISTS idx_hact_acct ON horeca_activities(horeca_account_id)',
+    ]
+    if USE_POSTGRES:
+        cur = db.cursor()
+        for s in stmts:
+            cur.execute(s)
+        db.commit()
+        cur.close()
+    else:
+        for s in stmts:
+            db.execute(s)
+        db.commit()
+    _HORECA_V2_READY = True
+
+
+@app.route('/api/horeca/agco/sync', methods=['POST'])
+@require_app_origin
+def api_horeca_agco_sync():
+    """Refresh the FULL licensee universe from the official AGCO open-data CSV
+    (or an uploaded copy). Upserts every currently-held licence (Active +
+    Deemed to Continue), computes chain-vs-independent (same normalized name
+    appearing on multiple licences = chain), buckets region (core/gtha/other),
+    and auto-links rows to existing book accounts by normalized name + city.
+    Rows are never deleted; a licensee that drops out of the file simply stops
+    getting last_seen updates."""
+    from datetime import date as _date
+    db = get_db()
+    _ensure_horeca_v2(db)
+
+    csv_text = None
+    if 'file' in request.files:
+        try:
+            csv_text = request.files['file'].read().decode('utf-8-sig')
+        except Exception as e:
+            return jsonify({'error': f'could not read uploaded CSV: {e}'}), 400
+    else:
+        if http_requests is None:
+            return jsonify({'error': 'requests library unavailable'}), 500
+        url = _AGCO_CSV_URL
+        try:
+            etag_cached = _agco_etag_cache.get(url)
+            req_headers = {'User-Agent': _PROSPECT_UA}
+            if etag_cached and etag_cached.get('etag'):
+                req_headers['If-None-Match'] = etag_cached['etag']
+            resp = http_requests.get(url, headers=req_headers, timeout=90)
+            if resp.status_code == 304 and etag_cached:
+                csv_text = etag_cached['text']
+            else:
+                resp.raise_for_status()
+                csv_text = resp.content.decode('utf-8-sig')
+                etag = (resp.headers.get('ETag') or '').strip()
+                if etag:
+                    _agco_etag_cache[url] = {'etag': etag, 'text': csv_text}
+        except Exception as e:
+            return jsonify({'error': f'could not fetch AGCO CSV: {e}'}), 502
+
+    reader = csv.DictReader(io.StringIO(csv_text))
+    keep_status = ('Active', 'Deemed to Continue')
+    rows = []
+    for row in reader:
+        status = (row.get('Licence Status') or '').strip()
+        if status not in keep_status:
+            continue
+        lic = (row.get('Licence Number') or '').strip()
+        name = (row.get('Premises Name') or '').strip() or \
+               (row.get('Legal Entity Name') or '').strip()
+        if not lic or not name:
+            continue
+        rows.append({
+            'lic': lic, 'name': name,
+            'address': ' '.join((row.get('Street Address') or '').split()),
+            'city': ' '.join((row.get('City') or '').split()).title(),
+            'postal': (row.get('Postal Code') or '').replace(' ', '').upper(),
+            'ltype': (row.get('Licence Type') or '').strip(),
+            'status': status,
+        })
+
+    # Chain detection across the whole file.
+    name_counts = {}
+    for r in rows:
+        key = _horeca_norm_name(r['name'])
+        name_counts[key] = name_counts.get(key, 0) + 1
+
+    # Book accounts for auto-matching (normalized name + loose city).
+    book = db_fetchall('SELECT id, name, city FROM horeca_accounts')
+    book_by_norm = {}
+    for b in book:
+        book_by_norm.setdefault(_horeca_norm_name(b[1]), []).append(
+            {'id': b[0], 'city': (b[2] or '').strip().lower()})
+
+    today = _date.today().isoformat()
+    ph = '%s' if USE_POSTGRES else '?'
+    existing = {r[0] for r in db_fetchall('SELECT licence_number FROM agco_licensees')}
+    inserted = updated = matched = 0
+    cur = db.cursor() if USE_POSTGRES else db
+    for r in rows:
+        norm = _horeca_norm_name(r['name'])
+        n_count = name_counts.get(norm, 1)
+        indep = 1 if n_count <= 1 else 0
+        region = _horeca_region(r['city'])
+        kind = _agco_kind(r['name'])
+        match_id = None
+        for cand in book_by_norm.get(norm, ()):
+            if not cand['city'] or not r['city'] or \
+               cand['city'] == r['city'].lower():
+                match_id = cand['id']
+                break
+        if match_id:
+            matched += 1
+        if r['lic'] in existing:
+            cur.execute(
+                f"UPDATE agco_licensees SET name={ph}, address={ph}, city={ph}, "
+                f"postal={ph}, licence_type={ph}, status={ph}, region={ph}, "
+                f"kind={ph}, name_count={ph}, is_independent={ph}, "
+                f"matched_account_id={ph}, last_seen={ph}, "
+                f"updated_at=CURRENT_TIMESTAMP WHERE licence_number={ph}",
+                (r['name'], r['address'], r['city'], r['postal'], r['ltype'],
+                 r['status'], region, kind, n_count, indep, match_id, today,
+                 r['lic']))
+            updated += 1
+        else:
+            cur.execute(
+                f"INSERT INTO agco_licensees (licence_number, name, address, "
+                f"city, postal, licence_type, status, region, kind, name_count, "
+                f"is_independent, matched_account_id, first_seen, last_seen) "
+                f"VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph})",
+                (r['lic'], r['name'], r['address'], r['city'], r['postal'],
+                 r['ltype'], r['status'], region, kind, n_count, indep,
+                 match_id, today, today))
+            inserted += 1
+    db.commit()
+    if USE_POSTGRES:
+        cur.close()
+
+    by_region = {reg: 0 for reg in ('core', 'gtha', 'other')}
+    for r in rows:
+        by_region[_horeca_region(r['city'])] += 1
+    return jsonify({
+        'status': 'ok', 'total_active': len(rows), 'inserted': inserted,
+        'updated': updated, 'matched_to_book': matched,
+        'independents': sum(1 for r in rows
+                            if name_counts.get(_horeca_norm_name(r['name']), 1) <= 1),
+        'by_region': by_region,
+    })
+
+
+@app.route('/api/horeca/prospects', methods=['GET'])
+def api_horeca_prospects():
+    """The target universe, ranked the way the agency sells: unmatched
+    independents in the core first, then GTHA, then the rest. Every row gets
+    Google Maps + Yelp deep links (free, no API keys). Filters: q, city,
+    region (core|gtha|other), kind, independent=1, unmatched=1."""
+    db = get_db()
+    _ensure_horeca_v2(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    where, params = ['1=1'], []
+    q = (request.args.get('q') or '').strip()
+    if q:
+        where.append(f'LOWER(name) LIKE {ph}')
+        params.append(f'%{q.lower()}%')
+    city = (request.args.get('city') or '').strip()
+    if city:
+        where.append(f'LOWER(city) = {ph}')
+        params.append(city.lower())
+    region = (request.args.get('region') or '').strip().lower()
+    if region in ('core', 'gtha', 'other'):
+        where.append(f'region = {ph}')
+        params.append(region)
+    kind = (request.args.get('kind') or '').strip().lower()
+    if kind:
+        where.append(f'kind = {ph}')
+        params.append(kind)
+    if request.args.get('independent', '').lower() in ('1', 'true', 'yes'):
+        where.append('is_independent = 1')
+    if request.args.get('unmatched', '').lower() in ('1', 'true', 'yes'):
+        where.append('matched_account_id IS NULL')
+    limit = max(1, min(request.args.get('limit', default=50, type=int), 200))
+    offset = max(0, request.args.get('offset', default=0, type=int))
+
+    region_rank = ("CASE region WHEN 'core' THEN 0 WHEN 'gtha' THEN 1 "
+                   "ELSE 2 END")
+    rows = db_fetchall(
+        f"SELECT licence_number, name, address, city, postal, licence_type, "
+        f"status, region, kind, name_count, is_independent, matched_account_id "
+        f"FROM agco_licensees WHERE {' AND '.join(where)} "
+        f"ORDER BY (matched_account_id IS NULL) DESC, is_independent DESC, "
+        f"{region_rank}, city, name LIMIT {limit} OFFSET {offset}",
+        params)
+    total = db_fetchall(
+        f"SELECT COUNT(*) FROM agco_licensees WHERE {' AND '.join(where)}",
+        params)[0][0]
+    out = []
+    for r in rows:
+        links = _venue_links(r[1], r[2], r[3])
+        out.append({
+            'licence_number': r[0], 'name': r[1], 'address': r[2],
+            'city': r[3], 'postal': r[4], 'licence_type': r[5],
+            'status': r[6], 'region': r[7], 'kind': r[8],
+            'locations': r[9], 'is_independent': bool(r[10]),
+            'matched_account_id': r[11], **links,
+        })
+    return jsonify({'count': total, 'rows': out, 'limit': limit,
+                    'offset': offset})
+
+
+@app.route('/api/horeca/order', methods=['POST'])
+@require_app_origin
+def api_horeca_order():
+    """Order capture (doc-09 ext 1). Records that a venue ordered our SKU
+    through the LCBO on its own licence: a deals row, stage='ordered'.
+    Flips the account to customer."""
+    data = request.get_json(silent=True) or {}
+    try:
+        account_id = int(data.get('account_id'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'account_id (integer) is required'}), 400
+    sku = (data.get('sku') or '').strip()
+    if not sku:
+        return jsonify({'error': 'sku is required'}), 400
+    cases = max(0, int(data.get('cases') or 0))
+    units = max(0, int(data.get('units') or 0))
+    rep = (data.get('rep') or '').strip()
+    notes = (data.get('notes') or '').strip()
+    lcbo_store = data.get('lcbo_store_number')
+    db = get_db()
+    _ensure_horeca_v2(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    acct = db_fetchall(
+        f'SELECT id, licence_sale_no FROM horeca_accounts WHERE id={ph}',
+        (account_id,))
+    if not acct:
+        return jsonify({'error': f'account {account_id} not found'}), 404
+    lsl = (data.get('licence_sale_no') or acct[0][1] or '').strip()
+    cur = db.cursor() if USE_POSTGRES else db
+    cur.execute(
+        f"INSERT INTO deals (horeca_account_id, sku, stage, expected_units, "
+        f"cases, lcbo_store_number, licence_sale_no, owner_rep, notes, source) "
+        f"VALUES ({ph},{ph},'ordered',{ph},{ph},{ph},{ph},{ph},{ph},'horeca_order')",
+        (account_id, sku, units, cases,
+         int(lcbo_store) if lcbo_store else None, lsl, rep, notes))
+    cur.execute(
+        f"UPDATE horeca_accounts SET status='customer', "
+        f"updated_at=CURRENT_TIMESTAMP WHERE id={ph}", (account_id,))
+    db.commit()
+    if USE_POSTGRES:
+        cur.close()
+    return jsonify({'status': 'ok', 'account_id': account_id, 'sku': sku,
+                    'cases': cases, 'units': units})
+
+
+@app.route('/api/horeca/reorder-due', methods=['GET'])
+def api_horeca_reorder_due():
+    """Doc-09 ext 2: customers whose latest order is older than the nudge
+    window (default 14 days — a placeholder dial; feni and whisky deplete
+    slower than vodka)."""
+    days = max(1, min(request.args.get('days', default=14, type=int), 365))
+    db = get_db()
+    _ensure_horeca_v2(db)
+    from datetime import datetime as _dtt, timedelta as _td
+    cutoff = (_dtt.now() - _td(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+    rows = db_fetchall(
+        "SELECT h.id, h.name, h.city, h.phone, h.contact_name, "
+        "       MAX(d.created_at) AS last_order, COUNT(d.id) AS orders "
+        "FROM horeca_accounts h "
+        "JOIN deals d ON d.horeca_account_id = h.id AND d.stage='ordered' "
+        "GROUP BY h.id, h.name, h.city, h.phone, h.contact_name")
+    due = []
+    for r in rows:
+        last = str(r[5] or '')
+        if last and last[:19] <= cutoff:
+            due.append({'account_id': r[0], 'name': r[1], 'city': r[2],
+                        'phone': r[3], 'contact_name': r[4],
+                        'last_order': last, 'orders': r[6],
+                        **_venue_links(r[1], '', r[2])})
+    due.sort(key=lambda x: x['last_order'])
+    return jsonify({'days': days, 'count': len(due), 'rows': due})
+
+
+@app.route('/api/horeca/menu-requests', methods=['GET'])
+def api_horeca_menu_requests():
+    """Doc-09 ext 5: every account that wants a cocktail menu / tent card, so
+    print runs batch from the existing MOVE THE BOTTLES kit."""
+    db = get_db()
+    _ensure_horeca_v2(db)
+    rows = db_fetchall(
+        "SELECT id, name, city, contact_name, phone, email, status "
+        "FROM horeca_accounts WHERE wants_cocktail_menu=1 ORDER BY city, name")
+    return jsonify({'count': len(rows), 'rows': [
+        {'account_id': r[0], 'name': r[1], 'city': r[2], 'contact_name': r[3],
+         'phone': r[4], 'email': r[5], 'status': r[6]} for r in rows]})
+
+
+# Trailing-90-day tier bands (doc 03; bands are a starting dial, [CONFIRM]
+# against real reorder data): Bronze 1-3 cases/90d, Silver 4-9, Gold 10+.
+def _horeca_tier(db, account_id):
+    from datetime import datetime as _dtt, timedelta as _td
+    ph = '%s' if USE_POSTGRES else '?'
+    cutoff = (_dtt.now() - _td(days=90)).strftime('%Y-%m-%d')
+    rows = db_fetchall(
+        f"SELECT COALESCE(SUM(cases),0) FROM deals "
+        f"WHERE horeca_account_id={ph} AND stage='ordered' "
+        f"AND created_at >= {ph}", (account_id, cutoff))
+    cases = int(rows[0][0] or 0)
+    if cases >= 10:
+        return 'Gold', cases
+    if cases >= 4:
+        return 'Silver', cases
+    if cases >= 1:
+        return 'Bronze', cases
+    return '', cases
+
+
+@app.route('/api/horeca/account/<int:hid>', methods=['GET'])
+def api_horeca_account_full(hid):
+    """The full ACCOUNT page: fields, tier, AGCO licence link, Google Maps +
+    Yelp links, order history, activity log."""
+    db = get_db()
+    _ensure_horeca_v2(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    rows = db_fetchall(
+        f"SELECT id, name, account_type, address, city, postal, phone, email, "
+        f"contact_name, contact_title, rep_name, status, priority, "
+        f"products_carried, notes, licence_sale_no, scheme, "
+        f"wants_cocktail_menu, source, last_visit, next_visit "
+        f"FROM horeca_accounts WHERE id={ph}", (hid,))
+    if not rows:
+        return jsonify({'error': 'not found'}), 404
+    r = rows[0]
+    tier, cases_90d = _horeca_tier(db, hid)
+    orders = db_fetchall(
+        f"SELECT id, sku, cases, expected_units, lcbo_store_number, "
+        f"licence_sale_no, owner_rep, notes, created_at FROM deals "
+        f"WHERE horeca_account_id={ph} AND stage='ordered' "
+        f"ORDER BY created_at DESC LIMIT 50", (hid,))
+    acts = db_fetchall(
+        f"SELECT id, rep, activity_type, notes, created_at "
+        f"FROM horeca_activities WHERE horeca_account_id={ph} "
+        f"ORDER BY created_at DESC LIMIT 50", (hid,))
+    agco = None
+    lsl = (r[15] or '').strip()
+    if lsl:
+        hit = db_fetchall(
+            f"SELECT licence_number, status, licence_type FROM agco_licensees "
+            f"WHERE licence_number={ph} OR licence_number={ph}",
+            (lsl, f'LSL{lsl}'))
+        if hit:
+            agco = {'licence_number': hit[0][0], 'status': hit[0][1],
+                    'licence_type': hit[0][2]}
+    return jsonify({
+        'account': {
+            'id': r[0], 'name': r[1], 'account_type': r[2], 'address': r[3],
+            'city': r[4], 'postal': r[5], 'phone': r[6], 'email': r[7],
+            'contact_name': r[8], 'contact_title': r[9], 'rep_name': r[10],
+            'status': r[11], 'priority': r[12], 'products_carried': r[13],
+            'notes': r[14], 'licence_sale_no': lsl, 'scheme': r[16] or '',
+            'wants_cocktail_menu': bool(r[17]), 'source': r[18],
+            'last_visit': str(r[19]) if r[19] else '',
+            'next_visit': str(r[20]) if r[20] else '',
+            **_venue_links(r[1], r[3], r[4]),
+        },
+        'tier': tier, 'cases_90d': cases_90d, 'agco_licence': agco,
+        'orders': [{'id': o[0], 'sku': o[1], 'cases': o[2] or 0,
+                    'units': o[3] or 0, 'lcbo_store_number': o[4],
+                    'licence_sale_no': o[5] or '', 'rep': o[6] or '',
+                    'notes': o[7] or '', 'at': str(o[8] or '')}
+                   for o in orders],
+        'activities': [{'id': a[0], 'rep': a[1], 'activity_type': a[2],
+                        'notes': a[3], 'at': str(a[4] or '')} for a in acts],
+    })
+
+
+@app.route('/api/horeca/activity', methods=['POST'])
+@require_app_origin
+def api_horeca_activity():
+    """Log a venue touch (visit / call / tasting / email) against an account."""
+    data = request.get_json(silent=True) or {}
+    try:
+        account_id = int(data.get('account_id'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'account_id (integer) is required'}), 400
+    db = get_db()
+    _ensure_horeca_v2(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    if not db_fetchall(f'SELECT id FROM horeca_accounts WHERE id={ph}',
+                       (account_id,)):
+        return jsonify({'error': f'account {account_id} not found'}), 404
+    cur = db.cursor() if USE_POSTGRES else db
+    cur.execute(
+        f"INSERT INTO horeca_activities (horeca_account_id, rep, "
+        f"activity_type, notes) VALUES ({ph},{ph},{ph},{ph})",
+        (account_id, (data.get('rep') or '').strip(),
+         (data.get('activity_type') or 'visit').strip(),
+         (data.get('notes') or '').strip()))
+    cur.execute(f"UPDATE horeca_accounts SET last_visit=CURRENT_DATE, "
+                f"updated_at=CURRENT_TIMESTAMP WHERE id={ph}", (account_id,))
+    db.commit()
+    if USE_POSTGRES:
+        cur.close()
+    return jsonify({'status': 'ok'})
+
+
+# Price-free portfolio (doc-09 ext 6). Venue-facing by design: names, origins
+# and stories only — NEVER a price, RRP, or per-drink figure.
+_HORECA_PORTFOLIO = [
+    {'brand': 'Rock Paper Rum', 'sku_name': 'Rock Paper Rum Indian Spiced',
+     'lcbo_num': '45378', 'origin': 'India', 'listing': 'live',
+     'story': 'Modern craft rum, good-barrel aged. The Indian Spiced pours neat, over a big cube, or in a spiced Old Fashioned.'},
+    {'brand': 'Goenchi', 'sku_name': 'Goenchi Cashew Feni',
+     'lcbo_num': '46340', 'origin': 'Goa, India', 'listing': 'live',
+     'story': "Goa's heritage spirit, small-batch distilled from cashew apple. A talking point no other back bar has."},
+    {'brand': 'Goenchi', 'sku_name': 'Goenchi Coconut Feni',
+     'lcbo_num': '46343', 'origin': 'Goa, India', 'listing': 'live',
+     'story': 'Coconut-sap feni: coastal, fruity, built for sours and highballs.'},
+    {'brand': 'Fratelli', 'sku_name': 'Fratelli Classic Shiraz',
+     'lcbo_num': '46282', 'origin': 'Akluj, India', 'listing': 'live',
+     'story': 'Approachable house red from a boutique Indian winery with a Tuscan winemaker.'},
+    {'brand': 'Fratelli', 'sku_name': 'Fratelli Chenin Blanc',
+     'lcbo_num': '46285', 'origin': 'Akluj, India', 'listing': 'live',
+     'story': 'Fresh by-the-glass white that pairs with seafood and lighter plates.'},
+    {'brand': 'Fratelli', 'sku_name': 'Fratelli Sauvignon Blanc',
+     'lcbo_num': '46286', 'origin': 'Akluj, India', 'listing': 'live',
+     'story': 'Crisp, citrus-bright white for the by-the-glass list.'},
+    {'brand': 'Fratelli', 'sku_name': 'Fratelli Cabernet Sauvignon',
+     'lcbo_num': '46287', 'origin': 'Akluj, India', 'listing': 'live',
+     'story': 'A red with the depth for grilled meats and richer mains.'},
+    {'brand': 'GianChand', 'sku_name': 'GianChand Single Malt Whisky',
+     'lcbo_num': '47777', 'origin': 'Jammu, India', 'listing': 'confirm before pitching',
+     'story': 'Single malt from the foothills: warm-climate aging brings it forward rich and fruit-first.'},
+    {'brand': 'Rutland Square', 'sku_name': 'Rutland Square Chai Spiced Gin',
+     'lcbo_num': '49902', 'origin': 'India', 'listing': 'live',
+     'story': 'A gin built on masala chai: cardamom, ginger, clove and black tea beside the juniper. The cool-weather signature serve.'},
+]
+
+
+@app.route('/api/horeca/portfolio', methods=['GET'])
+def api_horeca_portfolio():
+    return jsonify({'price_free': True, 'items': _HORECA_PORTFOLIO})
+
+
+@app.route('/api/horeca/seed-book', methods=['POST'])
+@require_app_origin
+def api_horeca_seed_book():
+    """One-shot, idempotent import of the field-built account book
+    (accounts_seed.csv, Sales Agency OS doc 01/09 column mapping). Upserts on
+    normalized name + city: existing rows only gain data into blank fields,
+    never lose it. Rows whose last_signal records a placed order AND carry a
+    licence_sale_no also get a deals row (stage='ordered'), once."""
+    if 'file' not in request.files:
+        return jsonify({'error': "multipart field 'file' (CSV) required"}), 400
+    try:
+        text = request.files['file'].read().decode('utf-8-sig')
+    except Exception as e:
+        return jsonify({'error': f'could not read CSV: {e}'}), 400
+    db = get_db()
+    _ensure_horeca_v2(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    book = db_fetchall('SELECT id, name, city FROM horeca_accounts')
+    by_key = {(_horeca_norm_name(b[1]), (b[2] or '').strip().lower()): b[0]
+              for b in book}
+    cur = db.cursor() if USE_POSTGRES else db
+    created = updated = orders_created = 0
+    for row in csv.DictReader(io.StringIO(text)):
+        name = (row.get('account_name') or '').strip()
+        if not name:
+            continue
+        city = (row.get('city') or '').strip()
+        key = (_horeca_norm_name(name), city.lower())
+        notes_bits = []
+        if (row.get('last_signal') or '').strip():
+            notes_bits.append('Signal: ' + row['last_signal'].strip())
+        if (row.get('next_action') or '').strip():
+            notes_bits.append('Next: ' + row['next_action'].strip())
+        notes = ' | '.join(notes_bits)
+        vals = {
+            'account_type': (row.get('account_type') or 'restaurant').strip(),
+            'address': (row.get('area') or '').strip(),
+            'phone': (row.get('phone') or '').strip(),
+            'email': (row.get('email') or '').strip(),
+            'contact_name': (row.get('contact_name') or '').strip(),
+            'status': (row.get('status') or 'prospect').strip(),
+            'priority': (row.get('priority') or 'P3').strip(),
+            'products_carried': (row.get('lead_sku') or '').strip(),
+            'licence_sale_no': (row.get('licence_sale_no') or '').strip(),
+            'source': (row.get('source') or 'seed').strip(),
+        }
+        hid = by_key.get(key)
+        if hid:
+            # Fill blanks only — a re-run or later edit never loses data.
+            existing_row = db_fetchall(
+                f"SELECT account_type, address, phone, email, contact_name, "
+                f"status, priority, products_carried, licence_sale_no, notes "
+                f"FROM horeca_accounts WHERE id={ph}", (hid,))[0]
+            keys = ['account_type', 'address', 'phone', 'email',
+                    'contact_name', 'status', 'priority', 'products_carried',
+                    'licence_sale_no']
+            sets, params = [], []
+            for i, k in enumerate(keys):
+                if not (existing_row[i] or '').strip() and vals[k]:
+                    sets.append(f'{k}={ph}')
+                    params.append(vals[k])
+            if notes and notes not in (existing_row[9] or ''):
+                sets.append(f'notes={ph}')
+                params.append(((existing_row[9] or '').strip() + '\n' + notes).strip())
+            if sets:
+                params.append(hid)
+                cur.execute(f"UPDATE horeca_accounts SET {', '.join(sets)}, "
+                            f"updated_at=CURRENT_TIMESTAMP WHERE id={ph}",
+                            params)
+                updated += 1
+        else:
+            cur.execute(
+                f"INSERT INTO horeca_accounts (name, account_type, address, "
+                f"city, phone, email, contact_name, status, priority, "
+                f"products_carried, licence_sale_no, notes, source) "
+                f"VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph})",
+                (name, vals['account_type'], vals['address'], city,
+                 vals['phone'], vals['email'], vals['contact_name'],
+                 vals['status'], vals['priority'], vals['products_carried'],
+                 vals['licence_sale_no'], notes, vals['source']))
+            created += 1
+            if USE_POSTGRES:
+                cur.execute('SELECT lastval()')
+                hid = cur.fetchone()[0]
+            else:
+                hid = cur.lastrowid if hasattr(cur, 'lastrowid') else \
+                    db.execute('SELECT last_insert_rowid()').fetchone()[0]
+            by_key[key] = hid
+        # The three live orders ride in as deals rows, once per account+source.
+        signal = (row.get('last_signal') or '').strip()
+        lsl = vals['licence_sale_no']
+        if hid and lsl and signal.lower().startswith('ordered'):
+            dupe = db_fetchall(
+                f"SELECT id FROM deals WHERE horeca_account_id={ph} "
+                f"AND source={ph}", (hid, vals['source']))
+            if not dupe:
+                cur.execute(
+                    f"INSERT INTO deals (horeca_account_id, sku, stage, "
+                    f"licence_sale_no, owner_rep, notes, source) "
+                    f"VALUES ({ph},{ph},'ordered',{ph},{ph},{ph},{ph})",
+                    (hid, vals['products_carried'], lsl, 'Ikshit',
+                     signal, vals['source']))
+                orders_created += 1
+    db.commit()
+    if USE_POSTGRES:
+        cur.close()
+    return jsonify({'status': 'ok', 'created': created, 'updated': updated,
+                    'orders_created': orders_created})
+
+
 @app.route('/api/crm/store/<int:store_number>/inventory', methods=['GET'])
 def api_crm_store_inventory(store_number):
     """Return current tracked-SKU status at this store from BOTH sources:
