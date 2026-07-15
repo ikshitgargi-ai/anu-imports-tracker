@@ -9027,6 +9027,68 @@ def api_sales_brief():
                     'source': AI_MODEL if ai else 'free rule-based'})
 
 
+def _geocode_pipeline(conn, limit=12):
+    """Give pipeline accounts map pins so the day router can route them.
+    (1) copy coordinates from the linked AGCO licence for free; (2) forward-
+    geocode the rest via Nominatim (throttled 1/s, small batches, resumable —
+    within fair use, unlike bulk Google). Cursor-only writes = Postgres-safe."""
+    ph = '%s' if USE_POSTGRES else '?'
+    cur = conn.cursor()
+    # (1) free copy from linked licence
+    cur.execute(
+        "SELECT h.id, a.lat, a.lng FROM horeca_accounts h "
+        "JOIN agco_licensees a ON h.licence_no = a.licence_number "
+        "WHERE COALESCE(h.lat,0)=0 AND COALESCE(a.lat,0)!=0")
+    copied = 0
+    for hid, la, ln in cur.fetchall():
+        c2 = conn.cursor()
+        c2.execute(f"UPDATE horeca_accounts SET lat={ph}, lng={ph} WHERE id={ph}",
+                   (la, ln, hid))
+        c2.close()
+        copied += 1
+    conn.commit()
+    # (2) forward-geocode the still-blank ones that have an address
+    cur.execute(
+        f"SELECT id, address, city, postal FROM horeca_accounts "
+        f"WHERE COALESCE(lat,0)=0 AND COALESCE(address,'')!='' "
+        f"AND status IN ('prospect','warm','tasting') "
+        f"ORDER BY priority, id LIMIT {int(limit)}")
+    todo = cur.fetchall()
+    cur.close()
+    geocoded = 0
+    for r in todo:
+        hid, address, city, postal = r[0], r[1], r[2], r[3]
+        q = ', '.join(x for x in (address, city, postal) if x)
+        pt = _nominatim_point(q)
+        if pt:
+            c2 = conn.cursor()
+            c2.execute(f"UPDATE horeca_accounts SET lat={ph}, lng={ph} WHERE id={ph}",
+                       (pt[0], pt[1], hid))
+            c2.close()
+            geocoded += 1
+    conn.commit()
+    return copied, geocoded
+
+
+@app.route('/api/sales/geocode-pipeline', methods=['POST'])
+@require_app_origin
+def api_sales_geocode_pipeline():
+    """Place map pins on pipeline accounts (free licence copy + throttled
+    Nominatim). Call repeatedly until 'remaining' hits 0 — each call is small
+    and resumable, and the scheduler also drains it hands-off."""
+    data = request.get_json(silent=True) or {}
+    limit = max(1, min(int(data.get('limit') or 12), 30))
+    db = get_db()
+    _ensure_gtha_sweep(db)
+    copied, geocoded = _geocode_pipeline(db, limit)
+    remaining = db_fetchall(
+        "SELECT COUNT(*) FROM horeca_accounts WHERE COALESCE(lat,0)=0 "
+        "AND COALESCE(address,'')!='' AND status IN ('prospect','warm','tasting')"
+    )[0][0]
+    return jsonify({'status': 'ok', 'copied_from_licence': copied,
+                    'forward_geocoded': geocoded, 'remaining': remaining})
+
+
 @app.route('/api/sales/pipeline', methods=['GET'])
 def api_sales_pipeline():
     """The self-building pipeline board: counts by stage + accounts whose next
@@ -26161,6 +26223,23 @@ def _auto_hunt_daily():
                 pass
 
 
+def _geocode_pipeline_daily():
+    conn = None
+    try:
+        conn = _sod_get_conn()
+        copied, geo = _geocode_pipeline(conn, limit=10)
+        if copied or geo:
+            print(f'[SALES] pinned {copied} from licence + {geo} geocoded')
+    except Exception as ex:
+        print(f'[SALES] pin-geocode skipped (self-heals next run): {ex}')
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def start_sales_scheduler():
     """Daily 06:30 ET auto-hunt so the pipeline fills itself as the sweep and
     enrichment grow the licensed universe."""
@@ -26181,12 +26260,18 @@ def start_sales_scheduler():
             sched = BackgroundScheduler(timezone='America/Toronto')
         except Exception:
             sched = BackgroundScheduler()
+        from apscheduler.triggers.interval import IntervalTrigger
         sched.add_job(_auto_hunt_daily, CronTrigger(hour=6, minute=30),
                       id='sales_auto_hunt', replace_existing=True,
                       max_instances=1, coalesce=True, misfire_grace_time=3600)
+        # Drain pins onto pipeline accounts so the day router always has
+        # something to route (free licence copy + throttled geocode).
+        sched.add_job(_geocode_pipeline_daily, IntervalTrigger(minutes=4),
+                      id='sales_geocode_pins', replace_existing=True,
+                      max_instances=1, coalesce=True, misfire_grace_time=600)
         sched.start()
         _sales_scheduler = sched
-        print('[SALES] auto-hunt scheduled daily 06:30 ET')
+        print('[SALES] auto-hunt daily 06:30 ET + pin-geocoder every 4 min')
     except Exception as e:
         print(f'[SALES] scheduler failed to start: {e}')
 

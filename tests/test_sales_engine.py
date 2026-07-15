@@ -163,3 +163,23 @@ class TestBriefAndPipeline:
             conn.close()
         assert len(promoted) == 1
         assert promoted[0]['city'].lower() == 'mississauga'
+
+
+class TestGeocodePipeline:
+    def test_copies_coords_from_linked_licence(self, seeded, client, app_module):
+        # Promote gtha (Mississauga), then simulate the prod case where the
+        # account was promoted BEFORE its licence had coords: zero its pin.
+        client.post('/api/sales/hunt', json={'region': 'gtha', 'limit': 5})
+        conn = app_module._sod_get_conn()
+        cur = conn.cursor()
+        ph = '%s' if app_module.USE_POSTGRES else '?'
+        cur.execute(f"UPDATE horeca_accounts SET lat=0, lng=0 "
+                    f"WHERE LOWER(city)={ph}", ('mississauga',))
+        conn.commit()
+        conn.close()
+        # geocode-pipeline copies the coords back from the linked licence (free).
+        r = client.post('/api/sales/geocode-pipeline', json={'limit': 5})
+        assert r.status_code == 200, r.get_json()
+        assert r.get_json()['copied_from_licence'] >= 1
+        dp = client.get('/api/sales/day-plan?region=gtha&days=1&stops_per_day=5').get_json()
+        assert dp['total_targets'] >= 1
