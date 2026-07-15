@@ -366,18 +366,21 @@ def test_refresh_default_is_async_and_folds_in_background(app_module, client, mo
     assert resp.status_code == 202
     assert resp.get_json()['status'] == 'started'
 
-    # Wait for the background daemon batch to finish (lock free = done).
-    for _ in range(200):
-        if app_module._live_batch_lock.acquire(blocking=False):
-            app_module._live_batch_lock.release()
+    # Poll the DB for the COMPLETED batch, not the lock. The lock heuristic
+    # raced: the poll could observe the lock free BEFORE the daemon thread
+    # acquired it, proceeding before the batch ran (flaky under load). Waiting
+    # for the actual 'ok' batch row is deterministic.
+    ok = live_rows = 0
+    for _ in range(400):  # up to ~8s
+        db = _db()
+        ok = db.execute(
+            "SELECT COUNT(*) FROM lcbo_live_batches WHERE status='ok'").fetchone()[0]
+        live_rows = db.execute(
+            "SELECT COUNT(*) FROM listing_ledger WHERE source='live'").fetchone()[0]
+        db.close()
+        if ok >= 1 and live_rows > 0:
             break
         _t.sleep(0.02)
 
-    db = _db()
-    ok = db.execute(
-        "SELECT COUNT(*) FROM lcbo_live_batches WHERE status='ok'").fetchone()[0]
-    live_rows = db.execute(
-        "SELECT COUNT(*) FROM listing_ledger WHERE source='live'").fetchone()[0]
-    db.close()
     assert ok >= 1, 'background batch should have completed with status ok'
     assert live_rows > 0, 'background batch should fold live ledger rows'
