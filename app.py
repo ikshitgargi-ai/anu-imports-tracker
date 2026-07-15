@@ -24153,6 +24153,23 @@ def api_live_refresh():
     return jsonify(summary)
 
 
+@app.route('/api/live/batches', methods=['GET'])
+def api_live_batches():
+    """Last 10 live batches with status + error — the observability window
+    for a batch that dies behind the proxy timeout."""
+    db = get_db()
+    _ensure_live_tables(db)
+    rows = db_fetchall(
+        "SELECT batch_id, started_at, finished_at, triggered_by, row_count, "
+        "store_count, status, error FROM lcbo_live_batches "
+        "ORDER BY started_at DESC LIMIT 10")
+    return jsonify({'batches': [
+        {'batch_id': r[0], 'started_at': str(r[1] or ''),
+         'finished_at': str(r[2] or ''), 'triggered_by': r[3],
+         'row_count': r[4], 'store_count': r[5], 'status': r[6],
+         'error': r[7]} for r in rows]})
+
+
 @app.route('/api/live/latest', methods=['GET'])
 @cached_response(ttl_seconds=60, key_args=('sku',))
 def api_live_latest():
