@@ -113,9 +113,11 @@ class TestLiveEngine:
         assert s1['skus'] == sorted(app_module.SOD_TRACKED_SKUS.keys())  # dynamic, all 9
         assert s1['row_count'] == 3 + (n_skus - 1)  # FOCUS 3 rows, others 1 default row
 
-        # Second batch via the on-demand endpoint (admin: localhost dev mode)
+        # Second batch via the on-demand endpoint (admin: localhost dev mode).
+        # ?wait=1 = synchronous mode (the default is now fire-and-forget on a
+        # background thread so the slow real scrape can't starve the web worker).
         monkeypatch.setattr(app_module, '_live_scrape_sku', _fake_scraper(BATCH2))
-        resp = client.post('/api/live/refresh')
+        resp = client.post('/api/live/refresh?wait=1')
         assert resp.status_code == 200
         s2 = resp.get_json()
         assert s2['status'] == 'ok'
@@ -302,6 +304,8 @@ def test_partial_batch_survives_a_midbatch_kill(app_module, monkeypatch):
     # Start from a clean ledger so the count is unambiguous (DELETE in a TEST is
     # fine — the immutability guard only greps app.py, never the tests).
     db0 = _db()
+    app_module._ensure_live_tables(db0)      # lazy DDL — tables may not exist yet
+    app_module._ensure_listing_ledger(db0)
     for t in ('listing_ledger', 'store_listings', 'lcbo_live_snapshots',
               'lcbo_live_batches', 'live_listing_events'):
         db0.execute(f"DELETE FROM {t}")
@@ -339,3 +343,41 @@ def test_partial_batch_survives_a_midbatch_kill(app_module, monkeypatch):
     # commit the kill never reached). After the fix the 2 completed SKUs persist.
     assert live_rows == KILL_AFTER, f'expected {KILL_AFTER} live rows, got {live_rows}'
     assert live_skus == KILL_AFTER
+
+
+def test_refresh_default_is_async_and_folds_in_background(app_module, client, monkeypatch):
+    """POST /api/live/refresh (no ?wait) returns 202 'started' immediately and runs
+    the batch OFF the web worker so the slow real scrape can't starve /healthz and
+    get the instance killed. The background batch still folds 'live' ledger rows."""
+    import time as _t
+    monkeypatch.setattr(app_module, 'LIVE_SCRAPE_GAP_SECONDS', 0)
+    monkeypatch.setattr(app_module, '_live_scrape_sku', _fake_scraper({FOCUS: [(1, 6)]}))
+
+    db0 = _db()
+    app_module._ensure_live_tables(db0)      # lazy DDL — tables may not exist yet
+    app_module._ensure_listing_ledger(db0)
+    for t in ('listing_ledger', 'store_listings', 'lcbo_live_snapshots',
+              'lcbo_live_batches', 'live_listing_events'):
+        db0.execute(f"DELETE FROM {t}")
+    db0.commit()
+    db0.close()
+
+    resp = client.post('/api/live/refresh')
+    assert resp.status_code == 202
+    assert resp.get_json()['status'] == 'started'
+
+    # Wait for the background daemon batch to finish (lock free = done).
+    for _ in range(200):
+        if app_module._live_batch_lock.acquire(blocking=False):
+            app_module._live_batch_lock.release()
+            break
+        _t.sleep(0.02)
+
+    db = _db()
+    ok = db.execute(
+        "SELECT COUNT(*) FROM lcbo_live_batches WHERE status='ok'").fetchone()[0]
+    live_rows = db.execute(
+        "SELECT COUNT(*) FROM listing_ledger WHERE source='live'").fetchone()[0]
+    db.close()
+    assert ok >= 1, 'background batch should have completed with status ok'
+    assert live_rows > 0, 'background batch should fold live ledger rows'

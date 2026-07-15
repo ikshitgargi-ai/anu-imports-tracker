@@ -25246,7 +25246,18 @@ def _safe_int_arg(name, default):
 @app.route('/api/live/refresh', methods=['POST'])
 def api_live_refresh():
     """On-demand live scrape batch (all tracked SKUs). Admin token, app origin,
-    or the SOD_CRON_TOKEN bearer (external cron safety net) may trigger it."""
+    or the SOD_CRON_TOKEN bearer (external cron safety net) may trigger it.
+
+    Runs the batch OFF the request worker (a daemon thread, like the hourly
+    scheduler) and returns 202 immediately. The scrape is slow on Render's
+    throttled free-tier egress — up to ~45s PER SKU, so a full 9-SKU batch takes
+    minutes. Running it inline held the single gunicorn worker (--workers 1) for
+    the whole scrape, so /healthz starved and Render restarted the instance
+    mid-batch (the request 502'd at ~48s, before even the first SKU committed, and
+    every write was lost). Off the worker the batch runs to completion and each
+    SKU commits as it lands (see run_live_batch). Poll /api/live/batches for
+    status. Pass ?wait=1 to run synchronously and get the summary back (used by
+    tests and any caller that wants the result inline)."""
     provided = (request.args.get('token') or '').strip()
     if not provided:
         auth = request.headers.get('Authorization', '')
@@ -25256,14 +25267,42 @@ def api_live_refresh():
     if not (_admin_token_ok() or _request_origin_ok() or cron_ok):
         return jsonify({'error': 'forbidden',
                         'detail': 'Admin token, app origin, or cron bearer required.'}), 403
-    summary = run_live_batch(triggered_by='cron' if cron_ok else 'manual')
-    _log_event('live_refresh', 'live_batch', summary.get('batch_id'),
-               'cron' if cron_ok else 'manual', summary)
-    if summary.get('status') == 'already_running':
-        return jsonify(summary), 202
-    if summary.get('status') == 'error':
-        return jsonify(summary), 502
-    return jsonify(summary)
+    triggered_by = 'cron' if cron_ok else 'manual'
+
+    wait = (request.args.get('wait') or '').strip().lower() in ('1', 'true', 'yes')
+    if wait:
+        # Synchronous mode — blocks until the batch finishes and returns the
+        # summary. Only safe for fast callers (tests with a mocked scraper); on
+        # prod this can 502 behind the proxy on the slow real scrape.
+        summary = run_live_batch(triggered_by=triggered_by)
+        _log_event('live_refresh', 'live_batch', summary.get('batch_id'),
+                   triggered_by, summary)
+        if summary.get('status') == 'already_running':
+            return jsonify(summary), 202
+        if summary.get('status') == 'error':
+            return jsonify(summary), 502
+        return jsonify(summary)
+
+    # Default: fire-and-forget on a background thread so the web worker stays
+    # free to answer /healthz (otherwise Render kills the instance mid-scrape).
+    if _live_batch_lock.locked():
+        return jsonify({'status': 'already_running',
+                        'detail': 'A live batch is already in progress; '
+                                  'poll /api/live/batches.'}), 202
+    _threading.Thread(
+        target=run_live_batch,
+        kwargs={'triggered_by': triggered_by},
+        daemon=True,
+        name=f'live-refresh-{triggered_by}',
+    ).start()
+    _log_event('live_refresh', 'live_batch', None, triggered_by,
+               {'status': 'started', 'mode': 'background'})
+    return jsonify({
+        'status': 'started',
+        'triggered_by': triggered_by,
+        'detail': 'Live batch running in the background (off the web worker); '
+                  'poll /api/live/batches for status and row_count.',
+    }), 202
 
 
 @app.route('/api/live/batches', methods=['GET'])

@@ -1,0 +1,33 @@
+# =============================================================================
+# FREE hourly "live" wake + trigger for the Anu Imports lcbo.com engine.
+#
+# WHY: the Render free tier sleeps when idle, so the in-app hourly scheduler
+# (08:00-21:00 ET) never fires, and the live shelf feed never runs. This Action
+# wakes the instance every business hour and kicks off a live batch. The
+# /api/live/refresh endpoint now returns immediately (the batch runs off the web
+# worker), so this call is fast and never hangs; each SKU commits as it lands.
+#
+# HOW TO ADD (workflow files can't be pushed without the `workflow` token scope,
+# so add it through the GitHub web UI — same way sod-daily.yml was added):
+#   1. github.com/ikshitgargi-ai/anu-imports-tracker → Add file → Create new file
+#   2. Path:  .github/workflows/live-hourly.yml
+#   3. Paste everything BELOW the divider line, commit to main.
+#   4. The SOD_CRON_TOKEN repo secret already exists (sod-daily.yml uses it) —
+#      nothing else to set up.
+#
+# Cron is UTC. 08:00-21:00 ET (EDT = UTC-4) = UTC 12:00-01:00, i.e. UTC hours
+# 12-23 plus 0-1. Adjust by one hour in EST (winter) if you want it exact.
+# -----------------------------------------------------------------------------
+name: Hourly live LCBO refresh
+on:
+  schedule:
+    - cron: "0 0-1,12-23 * * *"
+  workflow_dispatch:
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake the instance
+        run: curl -fsS --max-time 120 https://anu-imports-tracker.onrender.com/healthz || true
+      - name: Trigger a live batch (returns immediately; runs in background)
+        run: 'curl -fsS --max-time 60 -X POST -H "Authorization: Bearer ${{ secrets.SOD_CRON_TOKEN }}" https://anu-imports-tracker.onrender.com/api/live/refresh'
