@@ -8683,6 +8683,379 @@ def api_horeca_venues():
                     'offset': offset})
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# AI SALES ENGINE — turn the harvested universe into a self-building pipeline:
+#   • hunt: auto-promote the best untouched licensed targets into the pipeline
+#   • day-plan: territory-wise, geocoded, nearest-neighbour day routes that cut
+#     driving (time + gas), visits packed into days with one Maps link each
+#   • brief: an AI "why now + how to open" note per account (free fallback)
+#   • pipeline: the live board the hunt fills
+# Reuses haversine, the AGCO/OSM enriched geocodes, tiers, and the Claude call.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_LEAD_SKU_BY_KIND = {
+    'bar': 'Goenchi Cashew Feni + Rutland Square Chai Gin',
+    'club': 'Rock Paper Rum + Rutland Square Chai Gin',
+    'hotel': 'Fratelli wines + GianChand Single Malt',
+    'banquet': 'Rock Paper Rum + Fratelli wines',
+    'restaurant': 'Rock Paper Rum + Goenchi Cashew Feni',
+}
+
+
+def _lead_sku_for(kind):
+    return _LEAD_SKU_BY_KIND.get((kind or '').lower(),
+                                 'Rock Paper Rum + Goenchi Cashew Feni')
+
+
+def _target_score(is_independent, region, has_phone):
+    s = 0
+    if is_independent:
+        s += 3
+    s += {'core': 2, 'gtha': 1}.get(region, 0)
+    if has_phone:
+        s += 1
+    return s
+
+
+def _priority_for_score(score):
+    return 'P1' if score >= 5 else ('P2' if score >= 3 else 'P3')
+
+
+def _claude_complete(system, user, max_tokens=500):
+    """Reusable Claude call. Returns text, or None if no key / any error (so
+    every AI feature degrades gracefully to a free rule-based fallback)."""
+    if not ANTHROPIC_API_KEY or http_requests is None:
+        return None
+    try:
+        r = http_requests.post(
+            'https://api.anthropic.com/v1/messages',
+            headers={'x-api-key': ANTHROPIC_API_KEY,
+                     'anthropic-version': '2023-06-01',
+                     'content-type': 'application/json'},
+            json={'model': AI_MODEL, 'max_tokens': max_tokens,
+                  'system': system,
+                  'messages': [{'role': 'user', 'content': user}]},
+            timeout=30)
+        if r.status_code >= 400:
+            return None
+        parts = (r.json() or {}).get('content', [])
+        txt = ''.join(p.get('text', '') for p in parts
+                      if p.get('type') == 'text').strip()
+        return txt or None
+    except Exception:
+        return None
+
+
+def _gmaps_dir_url(points):
+    """Single Google Maps directions link through an ordered list of
+    (lat, lng) stops — the rep taps once and drives the whole day."""
+    from urllib.parse import quote
+    pts = [p for p in points if p and p[0] and p[1]]
+    if not pts:
+        return ''
+    if len(pts) == 1:
+        return f"https://www.google.com/maps/dir/?api=1&destination={pts[0][0]},{pts[0][1]}"
+    origin, dest, mids = pts[0], pts[-1], pts[1:-1]
+    url = (f"https://www.google.com/maps/dir/?api=1&origin={origin[0]},{origin[1]}"
+           f"&destination={dest[0]},{dest[1]}")
+    if mids:
+        url += "&waypoints=" + quote('|'.join(f"{p[0]},{p[1]}" for p in mids))
+    return url
+
+
+def _nn_order(points, start):
+    """Nearest-neighbour order of geocoded points from a start (lat, lng).
+    Returns (ordered_points, total_km)."""
+    remaining = list(points)
+    order, total = [], 0.0
+    cur = start
+    while remaining:
+        best, bd = None, 1e18
+        for p in remaining:
+            d = haversine(cur[0], cur[1], p['lat'], p['lng'])
+            if d < bd:
+                bd, best = d, p
+        total += bd
+        order.append(best)
+        remaining.remove(best)
+        cur = (best['lat'], best['lng'])
+    return order, total
+
+
+def _auto_hunt(conn, region='all', kind='', limit=25, rep='', days_out=3):
+    """Core lead-hunt used by BOTH the route (request conn) and the daily
+    scheduler (dedicated conn). All writes via cursors so it is Postgres-safe
+    from any thread. Idempotent: skips any licence already in the book."""
+    _ensure_gtha_sweep(conn)
+    ph = '%s' if USE_POSTGRES else '?'
+    where = ["matched_account_id IS NULL",
+             "status IN ('Active','Deemed to Continue')"]
+    params = []
+    if region in ('core', 'gtha', 'other'):
+        where.append(f'region = {ph}')
+        params.append(region)
+    if kind:
+        where.append(f'kind = {ph}')
+        params.append(kind)
+    cur = conn.cursor()
+    cur.execute(
+        f"SELECT licence_number, name, address, city, postal, region, kind, "
+        f"is_independent, COALESCE(phone,''), COALESCE(lat,0), COALESCE(lng,0) "
+        f"FROM agco_licensees WHERE {' AND '.join(where)} "
+        f"ORDER BY is_independent DESC, "
+        f"CASE region WHEN 'core' THEN 0 WHEN 'gtha' THEN 1 ELSE 2 END, "
+        f"(COALESCE(phone,'') != '') DESC, name LIMIT {limit * 3}", params)
+    rows = cur.fetchall()
+    cur.execute("SELECT name, city FROM horeca_accounts")
+    book = {(_horeca_norm_name(b[0]), (b[1] or '').strip().lower())
+            for b in cur.fetchall()}
+    cur.close()
+
+    from datetime import date as _date, timedelta as _td
+    nv = (_date.today() + _td(days=days_out)).isoformat()
+    promoted = []
+    for r in rows:
+        if len(promoted) >= limit:
+            break
+        licnum, name, address, city, postal, vregion, vkind, indep, phone, lat, lng = (
+            r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10])
+        key = (_horeca_norm_name(name), (city or '').strip().lower())
+        if key in book:
+            continue
+        book.add(key)
+        score = _target_score(bool(indep), vregion, bool(phone))
+        prio = _priority_for_score(score)
+        lead = _lead_sku_for(vkind)
+        note = (f"Auto-hunted {vkind or 'venue'} · "
+                f"{'independent' if indep else 'chain'} · licensed (AGCO {licnum}). "
+                f"Lead: {lead}.")
+        acct_type = vkind if vkind in ('bar', 'restaurant', 'hotel') else 'restaurant'
+        cur = conn.cursor()
+        ins = (f"INSERT INTO horeca_accounts (name, account_type, address, city, "
+               f"postal, phone, status, priority, products_carried, lat, lng, "
+               f"next_visit, notes, source, licence_no) VALUES "
+               f"({ph},{ph},{ph},{ph},{ph},{ph},'prospect',{ph},{ph},{ph},{ph},"
+               f"{ph},{ph},'auto-hunt',{ph})")
+        vals = (name, acct_type, address, city, postal, phone, prio, lead,
+                lat, lng, nv, note, licnum)
+        if USE_POSTGRES:
+            cur.execute(ins + " RETURNING id", vals)
+            hid = cur.fetchone()[0]
+        else:
+            cur.execute(ins, vals)
+            hid = cur.lastrowid
+        cur.execute(
+            f"INSERT INTO deals (horeca_account_id, sku, stage, owner_rep, "
+            f"next_action, next_action_date, source, notes) VALUES "
+            f"({ph},{ph},'prospecting',{ph},{ph},{ph},'auto-hunt',{ph})",
+            (hid, lead.split(' + ')[0], rep, 'First visit / intro', nv, note))
+        cur.execute(
+            f"UPDATE agco_licensees SET matched_account_id={ph} "
+            f"WHERE licence_number={ph}", (hid, licnum))
+        conn.commit()
+        cur.close()
+        promoted.append({'account_id': hid, 'name': name, 'city': city,
+                         'kind': vkind, 'priority': prio, 'lead_sku': lead,
+                         'phone': phone})
+    return promoted, nv
+
+
+@app.route('/api/sales/hunt', methods=['POST'])
+@require_app_origin
+def api_sales_hunt():
+    """Auto-hunt: promote the best untouched LICENSED targets from the AGCO
+    universe into the pipeline as prospects (+ a deals row), ranked by
+    independent > region > has-phone. Idempotent: never re-promotes a licence
+    already linked to the book. This is what makes the pipeline self-build."""
+    data = request.get_json(silent=True) or {}
+    promoted, nv = _auto_hunt(
+        get_db(),
+        region=(data.get('region') or 'all').strip().lower(),
+        kind=(data.get('kind') or '').strip().lower(),
+        limit=max(1, min(int(data.get('limit') or 25), 100)),
+        rep=(data.get('rep') or '').strip(),
+        days_out=max(0, min(int(data.get('days_out') or 3), 60)))
+    return jsonify({'status': 'ok', 'promoted': len(promoted),
+                    'next_visit': nv, 'targets': promoted})
+
+
+@app.route('/api/sales/day-plan', methods=['GET'])
+def api_sales_day_plan():
+    """Territory-wise, geocoded, gas-saving day routes. Pulls the rep's
+    geocoded pipeline targets (prospects/warm/tasting + reorder-due customers),
+    orders them nearest-neighbour from a start point, and packs them into days
+    of `stops_per_day`. Each day carries per-leg drive distance/time and one
+    Google Maps directions link for the whole run."""
+    rep = (request.args.get('rep') or '').strip()
+    city = (request.args.get('city') or '').strip()
+    region = (request.args.get('region') or '').strip().lower()
+    days = max(1, min(request.args.get('days', default=5, type=int), 14))
+    per_day = max(1, min(request.args.get('stops_per_day', default=8, type=int), 20))
+    try:
+        start_lat = float(request.args.get('start_lat') or REP_HOME['lat'])
+        start_lng = float(request.args.get('start_lng') or REP_HOME['lng'])
+    except (TypeError, ValueError):
+        start_lat, start_lng = REP_HOME['lat'], REP_HOME['lng']
+    db = get_db()
+    _ensure_gtha_sweep(db)
+    ph = '%s' if USE_POSTGRES else '?'
+
+    where = ["COALESCE(lat,0) != 0", "COALESCE(lng,0) != 0",
+             "status IN ('prospect','warm','tasting','customer')"]
+    params = []
+    if city:
+        where.append(f'LOWER(city) = {ph}')
+        params.append(city.lower())
+    if rep:
+        where.append(f"(COALESCE(rep_name,'')='' OR LOWER(rep_name)={ph})")
+        params.append(rep.lower())
+    rows = db_fetchall(
+        f"SELECT id, name, account_type, address, city, postal, phone, status, "
+        f"priority, products_carried, lat, lng, "
+        f"COALESCE(CAST(next_visit AS TEXT),''), COALESCE(CAST(last_visit AS TEXT),'') "
+        f"FROM horeca_accounts WHERE {' AND '.join(where)}", params)
+
+    targets = []
+    for r in rows:
+        vregion = _horeca_region(r[4])
+        if region in ('core', 'gtha', 'other') and vregion != region:
+            continue
+        targets.append({
+            'account_id': r[0], 'name': r[1], 'kind': r[2], 'address': r[3],
+            'city': r[4], 'postal': r[5], 'phone': r[6], 'status': r[7],
+            'priority': r[8], 'lead_sku': r[9],
+            'lat': float(r[10]), 'lng': float(r[11]),
+            'next_visit': r[12], 'last_visit': r[13],
+        })
+    if not targets:
+        return jsonify({'rep': rep, 'days': [], 'total_targets': 0,
+                        'note': 'No geocoded targets yet — run the sweep + '
+                                'enrich, or hunt new leads, to place pins.'})
+
+    # Priority-weighted then nearest-neighbour: P1 first as a soft bias, but
+    # the route itself is distance-optimised so we never zig-zag for priority.
+    ordered, total_km = _nn_order(targets, (start_lat, start_lng))
+
+    cap = days * per_day
+    ordered = ordered[:cap]
+    day_plans = []
+    prev = (start_lat, start_lng)
+    idx = 0
+    for d in range(days):
+        chunk = ordered[idx:idx + per_day]
+        idx += per_day
+        if not chunk:
+            break
+        stops = []
+        leg_km = 0.0
+        pt = prev
+        pts_for_url = [pt]
+        for t in chunk:
+            km = round(haversine(pt[0], pt[1], t['lat'], t['lng']), 1)
+            leg_km += km
+            stops.append({**t, 'leg_km': km,
+                          'drive_min': int(round(km / 40 * 60)),
+                          'maps_url': _venue_links(t['name'], t['address'], t['city'])['google_maps_url']})
+            pt = (t['lat'], t['lng'])
+            pts_for_url.append(pt)
+        drive_min = int(round(leg_km / 40 * 60))
+        dwell_min = len(stops) * 15
+        day_plans.append({
+            'day': d + 1, 'stops': stops, 'stop_count': len(stops),
+            'drive_km': round(leg_km, 1),
+            'est_drive_min': drive_min, 'est_total_min': drive_min + dwell_min,
+            'directions_url': _gmaps_dir_url(pts_for_url),
+        })
+        prev = pt
+
+    # Gas/time saved vs visiting in the raw (unordered) sequence.
+    raw = targets[:cap]
+    raw_km, pc = 0.0, (start_lat, start_lng)
+    for t in raw:
+        raw_km += haversine(pc[0], pc[1], t['lat'], t['lng'])
+        pc = (t['lat'], t['lng'])
+    planned_km = sum(dp['drive_km'] for dp in day_plans)
+    return jsonify({
+        'rep': rep, 'start': {'lat': start_lat, 'lng': start_lng},
+        'total_targets': len(targets), 'planned_stops': sum(dp['stop_count'] for dp in day_plans),
+        'days': day_plans,
+        'planned_km': round(planned_km, 1),
+        'unordered_km': round(raw_km, 1),
+        'km_saved': round(max(0.0, raw_km - planned_km), 1),
+    })
+
+
+@app.route('/api/sales/brief', methods=['POST'])
+@require_app_origin
+def api_sales_brief():
+    """AI-in-sales: a 2-sentence 'why now + how to open' brief for an account.
+    Uses Claude when a key is funded; otherwise a free rule-based line so it
+    always returns something useful."""
+    data = request.get_json(silent=True) or {}
+    try:
+        account_id = int(data.get('account_id'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'account_id (integer) required'}), 400
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    rows = db_fetchall(
+        f"SELECT name, account_type, city, status, priority, "
+        f"COALESCE(products_carried,''), COALESCE(phone,''), "
+        f"COALESCE(notes,'') FROM horeca_accounts WHERE id={ph}", (account_id,))
+    if not rows:
+        return jsonify({'error': 'account not found'}), 404
+    name, kind, city, status, priority, lead, phone, notes = rows[0]
+    lead = lead or _lead_sku_for(kind)
+    free = (f"{name} is a {'licensed ' if 'auto-hunt' in (notes or '').lower() else ''}"
+            f"{kind or 'venue'} in {city or 'the GTHA'} at the '{status}' stage. "
+            f"Open with {lead}; "
+            f"{'call ahead, ' if phone else 'walk in, '}"
+            f"lead with the story, offer a staff tasting, and capture which LCBO "
+            f"store they order through.")
+    system = ("You are a HORECA sales coach for Anu Spirits, an Ontario liquor "
+              "agency selling an Indian-forward portfolio (Rock Paper Rum, Goenchi "
+              "feni, Fratelli wines, Rutland Square chai gin, GianChand single "
+              "malt) to licensed venues that buy through the LCBO. Give a punchy "
+              "2-sentence opening play: why this venue now, and the exact first "
+              "move. No prices. No em dashes.")
+    user = (f"Venue: {name}. Type: {kind}. City: {city}. Pipeline stage: {status}. "
+            f"Suggested lead SKUs: {lead}. Has phone: {'yes' if phone else 'no'}. "
+            f"Notes: {notes[:300]}")
+    ai = _claude_complete(system, user, max_tokens=220)
+    return jsonify({'account_id': account_id, 'ai': bool(ai),
+                    'brief': ai or free,
+                    'source': AI_MODEL if ai else 'free rule-based'})
+
+
+@app.route('/api/sales/pipeline', methods=['GET'])
+def api_sales_pipeline():
+    """The self-building pipeline board: counts by stage + accounts whose next
+    visit is due or overdue (the rep's daily worklist)."""
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    from datetime import date as _date
+    today = _date.today().isoformat()
+    by_status = {r[0]: r[1] for r in db_fetchall(
+        "SELECT status, COUNT(*) FROM horeca_accounts GROUP BY status")}
+    auto = db_fetchall(
+        "SELECT COUNT(*) FROM horeca_accounts WHERE source='auto-hunt'")[0][0]
+    due = db_fetchall(
+        f"SELECT id, name, city, status, priority, COALESCE(products_carried,''), "
+        f"COALESCE(phone,''), COALESCE(CAST(next_visit AS TEXT),'') "
+        f"FROM horeca_accounts WHERE next_visit IS NOT NULL "
+        f"AND CAST(next_visit AS TEXT) <= {ph} "
+        f"AND status IN ('prospect','warm','tasting') "
+        f"ORDER BY priority, next_visit LIMIT 200", (today,))
+    return jsonify({
+        'by_status': by_status,
+        'auto_hunted': auto,
+        'due_today': [{'account_id': r[0], 'name': r[1], 'city': r[2],
+                       'status': r[3], 'priority': r[4], 'lead_sku': r[5],
+                       'phone': r[6], 'next_visit': r[7]} for r in due],
+        'due_count': len(due),
+    })
+
+
 @app.route('/api/horeca/order', methods=['POST'])
 @require_app_origin
 def api_horeca_order():
@@ -25763,6 +26136,62 @@ def start_sweep_scheduler():
 
 
 start_sweep_scheduler()
+
+
+_sales_scheduler = None
+
+
+def _auto_hunt_daily():
+    """Keep the pipeline self-building: promote a modest batch of fresh
+    licensed targets each morning on a dedicated connection."""
+    conn = None
+    try:
+        conn = _sod_get_conn()
+        promoted, _ = _auto_hunt(conn, region='all', limit=20, rep='',
+                                 days_out=3)
+        if promoted:
+            print(f'[SALES] auto-hunt promoted {len(promoted)} new prospects')
+    except Exception as ex:
+        print(f'[SALES] auto-hunt skipped (self-heals next run): {ex}')
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def start_sales_scheduler():
+    """Daily 06:30 ET auto-hunt so the pipeline fills itself as the sweep and
+    enrichment grow the licensed universe."""
+    global _sales_scheduler
+    if _sales_scheduler is not None:
+        return
+    if os.environ.get('PYTEST_CURRENT_TEST') or os.environ.get('DISABLE_SCHEDULERS'):
+        print('[SALES] scheduler NOT started (test run / DISABLE_SCHEDULERS)')
+        return
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+    except ImportError:
+        print('[SALES] apscheduler not installed — skipping')
+        return
+    try:
+        try:
+            sched = BackgroundScheduler(timezone='America/Toronto')
+        except Exception:
+            sched = BackgroundScheduler()
+        sched.add_job(_auto_hunt_daily, CronTrigger(hour=6, minute=30),
+                      id='sales_auto_hunt', replace_existing=True,
+                      max_instances=1, coalesce=True, misfire_grace_time=3600)
+        sched.start()
+        _sales_scheduler = sched
+        print('[SALES] auto-hunt scheduled daily 06:30 ET')
+    except Exception as e:
+        print(f'[SALES] scheduler failed to start: {e}')
+
+
+start_sales_scheduler()
 
 
 if __name__ == '__main__':
