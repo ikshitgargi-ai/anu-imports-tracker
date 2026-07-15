@@ -8406,32 +8406,37 @@ def api_horeca_enrich():
 
     # Index OSM venues that carry something worth copying, by (norm-name, city).
     venues = db_fetchall(
-        "SELECT osm_id, name, city, phone, website, lat, lng, cuisine "
-        "FROM osm_venues")
+        "SELECT osm_id, name, city, phone, website, lat, lng, cuisine, "
+        "COALESCE(address,'') FROM osm_venues")
     by_key = {}
-    for osm_id, name, city, phone, website, lat, lng, cuisine in venues:
+    for osm_id, name, city, phone, website, lat, lng, cuisine, oaddr in venues:
         key = (_horeca_norm_name(name), (city or '').strip().lower())
         # Prefer a venue that actually has contact detail.
         score = (1 if phone else 0) + (1 if website else 0) + (1 if lat else 0)
         cur_best = by_key.get(key)
         if cur_best is None or score > cur_best[0]:
             by_key[key] = (score, osm_id, phone or '', website or '',
-                           lat or 0, lng or 0, cuisine or '')
+                           lat or 0, lng or 0, cuisine or '', oaddr or '')
 
     # Enrich AGCO licensees.
     lic = db_fetchall(
         "SELECT licence_number, name, city, COALESCE(phone,''), "
-        "COALESCE(website,''), COALESCE(lat,0), COALESCE(lng,0) "
-        "FROM agco_licensees")
+        "COALESCE(website,''), COALESCE(lat,0), COALESCE(lng,0), "
+        "COALESCE(address,'') FROM agco_licensees")
     lic_updates = []
     matched_licences = []
-    for licnum, name, city, phone, website, lat, lng in lic:
+    osm_addr_updates = []   # backfill a mapped venue's blank street address
+    for licnum, name, city, phone, website, lat, lng, laddr in lic:
         key = (_horeca_norm_name(name), (city or '').strip().lower())
         hit = by_key.get(key)
         if not hit:
             continue
-        _, osm_id, ophone, owebsite, olat, olng, ocuisine = hit
+        _, osm_id, ophone, owebsite, olat, olng, ocuisine, oaddr = hit
         matched_licences.append((licnum, osm_id))
+        # If the mapped venue has no street address but the licence does, copy
+        # the official address onto the venue (free + storable; never Google).
+        if not (oaddr or '').strip() and (laddr or '').strip():
+            osm_addr_updates.append((laddr, (city or ''), osm_id))
         new_phone = phone or ophone
         new_web = website or owebsite
         new_lat = lat or olat
@@ -8455,6 +8460,14 @@ def api_horeca_enrich():
             cur.execute(
                 f"UPDATE osm_venues SET matched_licence={ph} WHERE osm_id={ph}",
                 (licnum, osm_id))
+        db.commit()
+    # Backfill blank venue addresses from the official licence address.
+    for i in range(0, len(osm_addr_updates), 500):
+        for addr, vcity, osm_id in osm_addr_updates[i:i + 500]:
+            cur.execute(
+                f"UPDATE osm_venues SET address={ph}, "
+                f"city=CASE WHEN COALESCE(city,'')='' THEN {ph} ELSE city END "
+                f"WHERE osm_id={ph}", (addr, vcity, osm_id))
         db.commit()
 
     # Enrich the field book (horeca_accounts) coords/phone where blank.
@@ -8485,6 +8498,7 @@ def api_horeca_enrich():
         'licensees_matched': len(matched_licences),
         'licensees_enriched': len(lic_updates),
         'book_accounts_enriched': book_updates,
+        'venue_addresses_filled': len(osm_addr_updates),
     })
 
 

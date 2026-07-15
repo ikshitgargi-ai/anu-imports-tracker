@@ -247,3 +247,27 @@ class TestStandaloneDrain:
         assert n == 2
         v = client.get('/api/horeca/venues?q=drain%20test').get_json()
         assert any(r['name'] == 'Drain Test Bar' for r in v['rows'])
+
+
+
+class TestAddressBackfill:
+    def test_enrich_backfills_blank_venue_address_from_licence(self, swept, client, app_module):
+        # The Unlicensed Diner has no address; give a matching AGCO licence an
+        # address and confirm enrich copies it onto the mapped venue.
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            ph = '%s' if app_module.USE_POSTGRES else '?'
+            cur = db.cursor() if app_module.USE_POSTGRES else db
+            # A licence that matches "Unlicensed Diner" by norm-name+city, with address.
+            cur.execute(
+                f"INSERT INTO agco_licensees (licence_number, name, city, address, "
+                f"region, kind, name_count, is_independent, status) "
+                f"VALUES ({ph},{ph},{ph},{ph},'core','restaurant',1,1,'Active')",
+                ('LSL30001', 'UNLICENSED DINER', 'Toronto', '5 REAL ST, TORONTO'))
+            db.commit()
+        r = client.post('/api/horeca/enrich', json={})
+        assert r.status_code == 200
+        assert r.get_json()['venue_addresses_filled'] >= 1
+        v = client.get('/api/horeca/venues?q=unlicensed%20diner').get_json()
+        diner = next(x for x in v['rows'] if 'Unlicensed' in x['name'])
+        assert '5 REAL ST' in diner['address']
