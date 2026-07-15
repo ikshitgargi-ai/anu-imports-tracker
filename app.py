@@ -7965,11 +7965,24 @@ def api_horeca_agco_sync():
         norm = _horeca_norm_name(r['name'])
         n_count = name_counts.get(norm, 1)
         match_id = None
-        for cand in book_by_norm.get(norm, ()):
-            if not cand['city'] or not r['city'] or \
-               cand['city'] == r['city'].lower():
+        candidates = book_by_norm.get(norm, [])
+        rc = (r['city'] or '').strip().lower()
+        # Exact city match always wins.
+        for cand in candidates:
+            cc = (cand['city'] or '').strip().lower()
+            if cc and rc and cc == rc:
                 match_id = cand['id']
                 break
+        # A blank city on either side is a wildcard that would wrongly link a
+        # same-named venue in a DIFFERENT city (e.g. two "Boston Pizza"), which
+        # then HIDES a real distinct-city prospect from the universe. Only allow
+        # a blank-city match when the name is unambiguous on BOTH sides: exactly
+        # one book row AND exactly one licence with that name (n_count == 1).
+        if match_id is None and len(candidates) == 1 and n_count == 1:
+            only = candidates[0]
+            cc = (only['city'] or '').strip().lower()
+            if not cc or not rc:
+                match_id = only['id']
         if match_id:
             matched += 1
         tuples.append((r['lic'], r['name'], r['address'], r['city'],

@@ -180,3 +180,28 @@ class TestCrmV2:
         dump = _json.dumps(body)
         assert '$' not in dump
         assert 'price' not in dump.replace('price_free', '')
+
+
+AGCO_AMBIG = '﻿' + '\n'.join([
+    'Licence Number,Licence Type,Legal Entity Name,Premises Name,Street Address,City,Province,Postal Code,Endorsement(s),Effective Date,Issue Date,Expiry Date,Deemed to Continue Until,Licence Status',
+    'LSL9001,Liquor Sales Licence,BP CO,BOSTON PIZZA,1 KING ST,TORONTO,ON,M5H1A1,,,,,,Active',
+    'LSL9002,Liquor Sales Licence,BP CO,BOSTON PIZZA,9 MAIN ST,HAMILTON,ON,L8P1A1,,,,,,Active',
+])
+
+
+class TestBlankCityMatch:
+    def test_blank_city_book_row_does_not_wildcard_match(self, client, app_module):
+        # A book account 'Boston Pizza' with a BLANK city must NOT auto-link to
+        # a same-named licensee in a specific city (that would hide the real
+        # distinct-city prospect). Two candidate cities → ambiguous → no match.
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            db.execute("INSERT INTO horeca_accounts (name, city, status) "
+                       "VALUES (?,?, 'prospect')", ('Boston Pizza', ''))
+            db.commit()
+        r = _upload(client, '/api/horeca/agco/sync', AGCO_AMBIG)
+        assert r.status_code == 200, r.get_json()
+        # Neither Boston Pizza licence is matched to the blank-city book row.
+        both = client.get('/api/horeca/prospects?q=boston%20pizza&unmatched=1').get_json()
+        names = [x['name'] for x in both['rows']]
+        assert names.count('BOSTON PIZZA') == 2, 'both distinct-city prospects must stay visible'
