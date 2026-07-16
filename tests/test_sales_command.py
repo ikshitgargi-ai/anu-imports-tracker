@@ -216,3 +216,34 @@ class TestScoreboardAndPlay:
 
     def test_move_bottles_rejects_unknown_sku(self, seeded, client):
         assert client.get('/api/sales/move-bottles?sku=99999').status_code == 400
+
+
+class TestAutopilot:
+    def test_generate_and_burn_down(self, seeded, client, app_module):
+        # backdate the Chai Corner order so it's reorder-due
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            db.execute("UPDATE deals SET created_at='2026-06-01 12:00:00' "
+                       "WHERE stage='ordered'")
+            db.commit()
+        r = client.post('/api/sales/actions/generate', json={})
+        assert r.status_code == 200, r.get_json()
+        assert r.get_json()['created'] >= 2   # reorder + store tasting (84 btl @ 555)
+        q = client.get('/api/sales/actions?rep=Namit').get_json()
+        kinds = {a['kind'] for a in q['rows']}
+        assert 'reorder_call' in kinds and 'store_tasting' in kinds
+        # store actions carry the ADDRESS beside the number (house rule)
+        st = next(a for a in q['rows'] if a['kind'] == 'store_tasting')
+        assert st['store_number'] and st['store_label']
+        # idempotent: re-generate adds nothing while actions stay open
+        assert client.post('/api/sales/actions/generate', json={}).get_json()['created'] == 0
+        # burn one down
+        aid = q['rows'][0]['id']
+        assert client.post(f'/api/sales/actions/{aid}/status',
+                           json={'status': 'done'}).status_code == 200
+        left = client.get('/api/sales/actions?rep=Namit').get_json()
+        assert all(a['id'] != aid for a in left['rows'])
+
+    def test_move_bottles_and_reconcile_carry_address(self, seeded, client):
+        b = client.get('/api/sales/move-bottles?sku=49902').get_json()
+        assert b['stock_by_store'][0]['address']   # street address present

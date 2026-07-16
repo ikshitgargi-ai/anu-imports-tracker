@@ -9224,6 +9224,29 @@ def _ensure_sales_cmd(db):
     _SALES_CMD_READY = True
 
 
+_store_label_cache = {}
+
+
+def _store_label(db, store_number):
+    """'Account, Address, City' for an LCBO store number — every surface that
+    shows a store number shows the address beside it (house rule)."""
+    if not store_number:
+        return ''
+    try:
+        sn = int(store_number)
+    except (TypeError, ValueError):
+        return ''
+    if sn in _store_label_cache:
+        return _store_label_cache[sn]
+    ph = '%s' if USE_POSTGRES else '?'
+    row = db_fetchall(f"SELECT COALESCE(account,''), COALESCE(address,''), "
+                      f"COALESCE(city,'') FROM stores WHERE store_number={ph}",
+                      (sn,))
+    label = ', '.join(x for x in (row[0][0], row[0][1], row[0][2]) if x) if row else ''
+    _store_label_cache[sn] = label
+    return label
+
+
 def _order_bottles(units, cases):
     """Bottles represented by an order row: explicit units win; otherwise
     cases × 12 (12/case assumption, flagged in the UI)."""
@@ -9662,13 +9685,15 @@ def api_sales_move_bottles():
     brand, name = SOD_TRACKED_SKUS[sku]
     stock_rows = db_fetchall(
         f"SELECT i.store_number, i.on_hand, COALESCE(s.account,''), "
-        f"COALESCE(s.city,''), COALESCE(s.lat,0), COALESCE(s.lng,0) "
+        f"COALESCE(s.city,''), COALESCE(s.lat,0), COALESCE(s.lng,0), "
+        f"COALESCE(s.address,'') "
         f"FROM sod_inventory i LEFT JOIN stores s ON s.store_number=i.store_number "
         f"WHERE i.sku={ph} AND i.snapshot_date=(SELECT MAX(snapshot_date) "
         f"FROM sod_inventory WHERE sku={ph}) AND i.on_hand>0 "
         f"ORDER BY i.on_hand DESC LIMIT 15", (sku, sku))
     stock = [{'store_number': r[0], 'on_hand': int(r[1] or 0), 'store': r[2],
-              'city': r[3], 'lat': float(r[4] or 0), 'lng': float(r[5] or 0)}
+              'city': r[3], 'lat': float(r[4] or 0), 'lng': float(r[5] or 0),
+              'address': r[6]}
              for r in stock_rows]
     total_stock = sum(s['on_hand'] for s in stock)
     # Tasting candidates: the deepest-stocked stores (a staff tasting there
@@ -9718,6 +9743,189 @@ def api_sales_move_bottles():
                  f'within 3 km of that stock (venue buys at its LCBO). '
                  f'3) Reorder-call every past buyer. Every bottle logged.'),
     })
+
+
+# ─── CLEARANCE AUTOPILOT ────────────────────────────────────────────────────
+# The sales-manager function, automated: every morning the system reads stock,
+# velocity, the pipeline and the target boards, DECIDES the work, and hands
+# each rep a prioritized burn-down queue. Minimum human intervention: the rep
+# executes and taps done; the queue refills itself.
+
+_ACTION_QUEUE_READY = False
+_AUTOPILOT_DEFAULT_REP = 'Namit'
+
+
+def _ensure_action_queue(conn):
+    global _ACTION_QUEUE_READY
+    if _ACTION_QUEUE_READY:
+        return
+    pk = 'BIGSERIAL PRIMARY KEY' if USE_POSTGRES else 'INTEGER PRIMARY KEY AUTOINCREMENT'
+    cur = conn.cursor()
+    cur.execute(f'''CREATE TABLE IF NOT EXISTS action_queue (
+        id {pk},
+        rep TEXT DEFAULT '',
+        kind TEXT NOT NULL,
+        sku TEXT DEFAULT '',
+        store_number INTEGER,
+        account_id INTEGER,
+        target_name TEXT DEFAULT '',
+        title TEXT NOT NULL,
+        why TEXT DEFAULT '',
+        priority INTEGER DEFAULT 50,
+        status TEXT DEFAULT 'open',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        done_at TIMESTAMP)''')
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_aq_rep ON action_queue(rep, status, priority)")
+    conn.commit()
+    cur.close()
+    _ACTION_QUEUE_READY = True
+
+
+def _generate_daily_actions(conn, rep=None):
+    """Fill the queue from live data. Idempotent: never duplicates an OPEN
+    action for the same (kind, sku, store/account). Sources:
+      1. reorder-due customers (highest value: they already buy),
+      2. stagnant deep-stock stores per SKU → book a staff tasting,
+      3. top-100 targets not yet in the book → first pitch."""
+    _ensure_action_queue(conn)
+    rep = rep or _AUTOPILOT_DEFAULT_REP
+    ph = '%s' if USE_POSTGRES else '?'
+    cur = conn.cursor()
+    cur.execute("SELECT kind, COALESCE(sku,''), store_number, account_id "
+                "FROM action_queue WHERE status='open'")
+    open_keys = {(r[0], r[1], r[2], r[3]) for r in cur.fetchall()}
+    created = 0
+
+    def _add(kind, title, why, priority, sku='', store_number=None,
+             account_id=None, target_name=''):
+        nonlocal created
+        key = (kind, sku or '', store_number, account_id)
+        if key in open_keys:
+            return
+        open_keys.add(key)
+        cur.execute(
+            f"INSERT INTO action_queue (rep, kind, sku, store_number, "
+            f"account_id, target_name, title, why, priority) "
+            f"VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph})",
+            (rep, kind, sku or '', store_number, account_id, target_name,
+             title, why, priority))
+        created += 1
+
+    # 1) reorder-due customers (14d quiet)
+    from datetime import datetime as _dtt, timedelta as _td
+    cutoff = (_dtt.now() - _td(days=14)).strftime('%Y-%m-%d %H:%M:%S')
+    cur.execute(
+        "SELECT h.id, h.name, h.city, MAX(d.created_at) FROM horeca_accounts h "
+        "JOIN deals d ON d.horeca_account_id=h.id AND d.stage='ordered' "
+        "GROUP BY h.id, h.name, h.city")
+    for hid, name, city, last in cur.fetchall():
+        if str(last or '')[:19] <= cutoff:
+            _add('reorder_call', f'Reorder call: {name} ({city})',
+                 'Bought before, quiet 14+ days — the cheapest case we can move.',
+                 90, account_id=hid, target_name=name)
+    # 2) stagnant deep stock → staff tasting at the store
+    cur.execute(
+        "SELECT i.sku, i.store_number, i.on_hand, COALESCE(s.account,''), "
+        "COALESCE(s.address,''), COALESCE(s.city,'') FROM sod_inventory i "
+        "LEFT JOIN stores s ON s.store_number=i.store_number "
+        "WHERE i.snapshot_date=(SELECT MAX(snapshot_date) FROM sod_inventory) "
+        "AND i.on_hand >= 24 ORDER BY i.on_hand DESC LIMIT 20")
+    for sku, sn, on_hand, acct, addr, city in cur.fetchall():
+        nm = SOD_TRACKED_SKUS.get(sku, ('', sku))[1]
+        label = ', '.join(x for x in (acct, addr, city) if x)
+        _add('store_tasting', f'Book staff tasting: #{sn} {label}',
+             f'{on_hand} bottles of {nm} sitting here — a staff tasting is the '
+             f'fastest shelf-clearer.', 75, sku=sku, store_number=sn,
+             target_name=acct)
+    # 3) top-100 targets not in the book yet (first pitch)
+    cur.execute(
+        "SELECT list_key, rank, name, city, area, why FROM target_list_entries "
+        "WHERE account_id IS NULL ORDER BY list_key, rank LIMIT 30")
+    for lk, rank, name, city, area, why in cur.fetchall():
+        if rank <= 10:
+            _add('first_pitch', f'First pitch: {name} ({area or city})',
+                 f'#{rank} on the {lk} board. {why[:120]}', 60,
+                 target_name=name)
+    conn.commit()
+    cur.close()
+    return created
+
+
+@app.route('/api/sales/actions/generate', methods=['POST'])
+@require_app_origin
+def api_actions_generate():
+    d = request.get_json(silent=True) or {}
+    n = _generate_daily_actions(get_db(), rep=(d.get('rep') or '').strip() or None)
+    return jsonify({'status': 'ok', 'created': n})
+
+
+@app.route('/api/sales/actions', methods=['GET'])
+def api_actions_list():
+    rep = (request.args.get('rep') or '').strip()
+    status = (request.args.get('status') or 'open').strip()
+    db = get_db()
+    _ensure_action_queue(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    where, params = [f"status={ph}"], [status]
+    if rep:
+        where.append(f"LOWER(rep)={ph}")
+        params.append(rep.lower())
+    rows = db_fetchall(
+        f"SELECT id, rep, kind, sku, store_number, account_id, target_name, "
+        f"title, why, priority, status, CAST(created_at AS TEXT) "
+        f"FROM action_queue WHERE {' AND '.join(where)} "
+        f"ORDER BY priority DESC, id LIMIT 100", params)
+    return jsonify({'count': len(rows), 'rows': [
+        {'id': r[0], 'rep': r[1], 'kind': r[2], 'sku': r[3],
+         'store_number': r[4],
+         'store_label': _store_label(db, r[4]) if r[4] else '',
+         'account_id': r[5], 'target_name': r[6], 'title': r[7], 'why': r[8],
+         'priority': r[9], 'status': r[10], 'created_at': r[11]}
+        for r in rows]})
+
+
+@app.route('/api/sales/actions/<int:aid>/status', methods=['POST'])
+@require_app_origin
+def api_actions_status(aid):
+    d = request.get_json(silent=True) or {}
+    status = (d.get('status') or '').strip().lower()
+    if status not in ('done', 'skipped', 'open'):
+        return jsonify({'error': 'status must be done|skipped|open'}), 400
+    db = get_db()
+    _ensure_action_queue(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    cur = db.cursor()
+    if status == 'done':
+        cur.execute(f"UPDATE action_queue SET status={ph}, "
+                    f"done_at=CURRENT_TIMESTAMP WHERE id={ph}", (status, aid))
+    else:
+        cur.execute(f"UPDATE action_queue SET status={ph} WHERE id={ph}",
+                    (status, aid))
+    n = cur.rowcount
+    db.commit()
+    cur.close()
+    if not n:
+        return jsonify({'error': 'not found'}), 404
+    return jsonify({'status': 'ok', 'id': aid, 'new_status': status})
+
+
+def _autopilot_daily():
+    """Scheduler body: refill every rep's queue each morning on a dedicated
+    connection (cursor-only writes; no Flask g)."""
+    conn = None
+    try:
+        conn = _sod_get_conn()
+        n = _generate_daily_actions(conn)
+        if n:
+            print(f'[AUTOPILOT] queued {n} actions')
+    except Exception as ex:
+        print(f'[AUTOPILOT] skipped (self-heals tomorrow): {ex}')
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 _OFFICIAL_STORE_REPS = ('ikshit', 'vaneet', 'ed', 'namit')
@@ -9945,6 +10153,7 @@ def api_horeca_account_full(hid):
         'tier': tier, 'cases_90d': cases_90d, 'agco_licence': agco,
         'orders': [{'id': o[0], 'sku': o[1], 'cases': o[2] or 0,
                     'units': o[3] or 0, 'lcbo_store_number': o[4],
+                    'lcbo_store_label': _store_label(db, o[4]),
                     'licence_sale_no': o[5] or '', 'rep': o[6] or '',
                     'notes': o[7] or '', 'at': str(o[8] or '')}
                    for o in orders],
@@ -26150,6 +26359,7 @@ def api_reconcile():
                 'product_name': pname,
                 'store_number': sn,
                 'account': dinfo.get('account') or (l['store_name'] if l else '') or '',
+                'address': dinfo.get('address') or (l.get('address') if l else '') or '',
                 'city': dinfo.get('city') or (l['city'] if l else '') or '',
                 'sod_on_hand': sod_qty,
                 'sod_status': s['status'] if s else None,
@@ -26204,10 +26414,11 @@ def _stores_directory():
     """{store_number: {'account', 'city'}} from the master stores directory."""
     out = {}
     try:
-        for r in db_fetchall("SELECT store_number, account, city FROM stores"):
+        for r in db_fetchall("SELECT store_number, account, city, address FROM stores"):
             d = row_to_dict(r)
             out[int(d['store_number'])] = {'account': d.get('account'),
-                                           'city': d.get('city')}
+                                           'city': d.get('city'),
+                                           'address': d.get('address')}
     except Exception as e:
         print(f'[listings] stores directory read failed (non-fatal): {e}')
     return out
@@ -26537,6 +26748,7 @@ def api_listings():
             'store_number': sn,
             'account': dinfo.get('account'),
             'city': dinfo.get('city'),
+            'address': dinfo.get('address'),
             'status': d['status'],
             'first_listed_date': fld,
             'last_confirmed_date': lcd,
@@ -26627,6 +26839,7 @@ def api_listings_added():
             'store_number': sn,
             'account': dinfo.get('account'),
             'city': dinfo.get('city'),
+            'address': dinfo.get('address'),
             'source': d['source'],
             'source_detail': d['source_detail'],
             'observed_date': d['observed_date'],
@@ -26988,6 +27201,10 @@ def start_sales_scheduler():
         sched.add_job(_geocode_pipeline_daily, IntervalTrigger(minutes=4),
                       id='sales_geocode_pins', replace_existing=True,
                       max_instances=1, coalesce=True, misfire_grace_time=600)
+        # Clearance autopilot: refill the rep action queue every morning.
+        sched.add_job(_autopilot_daily, CronTrigger(hour=6, minute=45),
+                      id='sales_autopilot', replace_existing=True,
+                      max_instances=1, coalesce=True, misfire_grace_time=3600)
         sched.start()
         _sales_scheduler = sched
         print('[SALES] auto-hunt daily 06:30 ET + pin-geocoder every 4 min')
