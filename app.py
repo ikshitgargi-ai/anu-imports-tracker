@@ -9788,6 +9788,7 @@ def _generate_daily_actions(conn, rep=None):
       2. stagnant deep-stock stores per SKU → book a staff tasting,
       3. top-100 targets not yet in the book → first pitch."""
     _ensure_action_queue(conn)
+    _ensure_sales_cmd(conn)
     rep = rep or _AUTOPILOT_DEFAULT_REP
     ph = '%s' if USE_POSTGRES else '?'
     cur = conn.cursor()
@@ -9832,13 +9833,14 @@ def _generate_daily_actions(conn, rep=None):
         "COALESCE(s.city,''), SUM(i.on_hand) AS tot, COUNT(DISTINCT i.sku) "
         "FROM sod_inventory i LEFT JOIN stores s ON s.store_number=i.store_number "
         "WHERE i.snapshot_date=(SELECT MAX(snapshot_date) FROM sod_inventory) "
-        "AND i.on_hand >= 24 "
+        "AND i.on_hand > 0 "
         "GROUP BY i.store_number, s.account, s.address, s.city "
+        "HAVING SUM(i.on_hand) >= 24 "
         "ORDER BY tot DESC LIMIT 12")
     _DEPOTS = {940, 947, 950, 974}
     for sn, acct, addr, city, tot, nskus in cur.fetchall():
-        if sn in _DEPOTS or (acct or '').strip().upper().startswith('LCBO #'):
-            continue  # warehouse/depot or directory-less placeholder
+        if sn in _DEPOTS:
+            continue  # warehouse/depot — reserve stock, not a tasteable shelf
         label = ', '.join(x for x in (acct, addr, city) if x)
         _add('store_tasting', f'Book staff tasting: #{sn} {label}',
              f'{int(tot)} bottles across {nskus} SKU(s) sitting here — one '
@@ -9847,12 +9849,15 @@ def _generate_daily_actions(conn, rep=None):
     # 3) top-100 targets not in the book yet (first pitch)
     cur.execute(
         "SELECT list_key, rank, name, city, area, why FROM target_list_entries "
-        "WHERE account_id IS NULL ORDER BY list_key, rank LIMIT 30")
+        "WHERE account_id IS NULL ORDER BY list_key, rank")
+    per_list = {}
     for lk, rank, name, city, area, why in cur.fetchall():
-        if rank <= 10:
-            _add('first_pitch', f'First pitch: {name} ({area or city})',
-                 f'#{rank} on the {lk} board. {why[:120]}', 60,
-                 target_name=name)
+        if per_list.get(lk, 0) >= 5:
+            continue  # top 5 unmatched per board keeps the queue focused
+        per_list[lk] = per_list.get(lk, 0) + 1
+        _add('first_pitch', f'First pitch: {name} ({area or city})',
+             f'#{rank} on the {lk} board. {(why or "")[:120]}', 60,
+             target_name=name)
     conn.commit()
     cur.close()
     return created
