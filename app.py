@@ -995,6 +995,10 @@ def init_db():
             ('deals', 'cases', "INTEGER DEFAULT 0"),
             ('deals', 'lcbo_store_number', "INTEGER"),
             ('deals', 'licence_sale_no', "TEXT DEFAULT ''"),
+            # CRM payments tracking (internal only — never venue-facing)
+            ('deals', 'payment_status', "TEXT DEFAULT ''"),
+            ('deals', 'payment_note', "TEXT DEFAULT ''"),
+            ('deals', 'paid_at', "TIMESTAMP"),
         ]
         for table, col, coltype in crm_migrate_cols:
             try:
@@ -1475,6 +1479,10 @@ def init_db():
             ('deals', 'cases', "INTEGER DEFAULT 0"),
             ('deals', 'lcbo_store_number', "INTEGER"),
             ('deals', 'licence_sale_no', "TEXT DEFAULT ''"),
+            # CRM payments tracking (internal only — never venue-facing)
+            ('deals', 'payment_status', "TEXT DEFAULT ''"),
+            ('deals', 'payment_note', "TEXT DEFAULT ''"),
+            ('deals', 'paid_at', "TIMESTAMP"),
         ]
         for table, col, coltype in migrate_cols:
             try:
@@ -9122,6 +9130,594 @@ def api_sales_geocode_pipeline():
     )[0][0]
     return jsonify({'status': 'ok', 'copied_from_licence': copied,
                     'forward_geocoded': geocoded, 'remaining': remaining})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SALES COMMAND — the layer that makes the tool itself a driver of sales:
+#   • commission engine: per-bottle bonus programs (Rutland $6/btl for the rep)
+#     credited automatically from HORECA orders + manually from tastings/IST
+#   • payments: order → invoiced → paid tracked on every deal (internal only)
+#   • next-best-calls: GPS or typed address → the ranked call list right here
+#   • Top-100 target boards: general / indian / volume, area-quota'd, built
+#     from the licensed universe + our own research imports
+#   • scoreboard: points of distribution + sell-through + bonus earned
+#   • move-bottles: pick a SKU, get the play (stock, tastings, pitches, reorders)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_SALES_CMD_READY = False
+
+_INDIAN_NAME_KEYWORDS = (
+    'india', 'indian', 'tandoor', 'curry', 'biryani', 'masala', 'desi',
+    'punjab', 'bombay', 'mumbai', 'delhi', 'hyderabad', 'karahi', 'kadai',
+    'dosa', 'chaat', 'tikka', 'mirchi', 'chai', 'saffron', 'shah', 'mehfil',
+    'haveli', 'dhaba', 'roti', 'paratha', 'kebab', 'kabab', 'goa', 'kerala',
+    'madras', 'chennai', 'amritsar', 'lahore', 'hakka',
+)
+
+_TOP100_AREAS = [
+    # (area label, matching cities lowercase, quota per 100)
+    ('Downtown / Core Toronto', ('toronto',), 26),
+    ('North York', ('north york',), 10),
+    ('Scarborough', ('scarborough',), 8),
+    ('Etobicoke', ('etobicoke', 'york', 'east york'), 8),
+    ('Mississauga', ('mississauga', 'malton', 'streetsville', 'port credit'), 12),
+    ('Brampton', ('brampton',), 10),
+    ('Vaughan', ('vaughan', 'woodbridge', 'concord', 'maple', 'kleinburg'), 9),
+    ('Richmond Hill', ('richmond hill',), 8),
+    ('Markham', ('markham', 'thornhill', 'unionville'), 9),
+]
+
+
+def _ensure_sales_cmd(db):
+    global _SALES_CMD_READY
+    if _SALES_CMD_READY:
+        return
+    pk = 'BIGSERIAL PRIMARY KEY' if USE_POSTGRES else 'INTEGER PRIMARY KEY AUTOINCREMENT'
+    stmts = [
+        f'''CREATE TABLE IF NOT EXISTS commission_programs (
+               id {pk},
+               sku TEXT NOT NULL,
+               sku_name TEXT DEFAULT '',
+               per_unit_bonus REAL NOT NULL,
+               rep TEXT DEFAULT '',
+               active INTEGER DEFAULT 1,
+               notes TEXT DEFAULT '',
+               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
+        f'''CREATE TABLE IF NOT EXISTS commission_credits (
+               id {pk},
+               program_id INTEGER,
+               rep TEXT NOT NULL,
+               sku TEXT NOT NULL,
+               units INTEGER NOT NULL,
+               source TEXT DEFAULT 'manual',
+               store_number INTEGER,
+               account_id INTEGER,
+               note TEXT DEFAULT '',
+               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
+        f'''CREATE TABLE IF NOT EXISTS target_list_entries (
+               id {pk},
+               list_key TEXT NOT NULL,
+               rank INTEGER DEFAULT 0,
+               name TEXT NOT NULL,
+               city TEXT DEFAULT '',
+               area TEXT DEFAULT '',
+               category TEXT DEFAULT '',
+               why TEXT DEFAULT '',
+               score REAL DEFAULT 0,
+               licence_number TEXT DEFAULT '',
+               account_id INTEGER,
+               source TEXT DEFAULT 'data',
+               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
+        'CREATE INDEX IF NOT EXISTS idx_tle_list ON target_list_entries(list_key, rank)',
+        'CREATE INDEX IF NOT EXISTS idx_cc_rep ON commission_credits(rep, sku)',
+    ]
+    if USE_POSTGRES:
+        cur = db.cursor()
+        for s in stmts:
+            cur.execute(s)
+        db.commit()
+        cur.close()
+    else:
+        for s in stmts:
+            db.execute(s)
+        db.commit()
+    _SALES_CMD_READY = True
+
+
+def _order_bottles(units, cases):
+    """Bottles represented by an order row: explicit units win; otherwise
+    cases × 12 (12/case assumption, flagged in the UI)."""
+    u = int(units or 0)
+    if u > 0:
+        return u
+    return int(cases or 0) * 12
+
+
+@app.route('/api/sales/commission/program', methods=['POST'])
+@require_app_origin
+def api_commission_program():
+    """Create/update a per-bottle bonus program, e.g. Rutland Square $6/btl.
+    rep='' means every rep qualifies; a name scopes it."""
+    d = request.get_json(silent=True) or {}
+    sku = _pad_sku(str(d.get('sku') or '').strip())
+    try:
+        bonus = float(d.get('per_unit_bonus'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'per_unit_bonus (number) required'}), 400
+    if not sku:
+        return jsonify({'error': 'sku required'}), 400
+    db = get_db()
+    _ensure_sales_cmd(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    sku_name = (d.get('sku_name') or SOD_TRACKED_SKUS.get(sku, ('', ''))[1] or '').strip()
+    rep = (d.get('rep') or '').strip()
+    notes = (d.get('notes') or '').strip()
+    cur = db.cursor()
+    cur.execute(f"SELECT id FROM commission_programs WHERE sku={ph} AND rep={ph} AND active=1",
+                (sku, rep))
+    row = cur.fetchone()
+    if row:
+        cur.execute(f"UPDATE commission_programs SET per_unit_bonus={ph}, "
+                    f"sku_name={ph}, notes={ph} WHERE id={ph}",
+                    (bonus, sku_name, notes, row[0]))
+        pid = row[0]
+    else:
+        if USE_POSTGRES:
+            cur.execute(f"INSERT INTO commission_programs (sku, sku_name, "
+                        f"per_unit_bonus, rep, notes) VALUES ({ph},{ph},{ph},{ph},{ph}) "
+                        f"RETURNING id", (sku, sku_name, bonus, rep, notes))
+            pid = cur.fetchone()[0]
+        else:
+            cur.execute(f"INSERT INTO commission_programs (sku, sku_name, "
+                        f"per_unit_bonus, rep, notes) VALUES ({ph},{ph},{ph},{ph},{ph})",
+                        (sku, sku_name, bonus, rep, notes))
+            pid = cur.lastrowid
+    db.commit()
+    cur.close() if USE_POSTGRES else None
+    return jsonify({'status': 'ok', 'program_id': pid, 'sku': sku,
+                    'per_unit_bonus': bonus, 'rep': rep or 'all reps'})
+
+
+@app.route('/api/sales/bottles-moved', methods=['POST'])
+@require_app_origin
+def api_bottles_moved():
+    """Log bottles moved outside a HORECA order — a staff tasting, an in-store
+    tasting (IST), a hand-sell — so the bonus tracker credits them."""
+    d = request.get_json(silent=True) or {}
+    sku = _pad_sku(str(d.get('sku') or '').strip())
+    rep = (d.get('rep') or '').strip()
+    try:
+        units = int(d.get('units'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'units (integer) required'}), 400
+    if not sku or not rep or units <= 0:
+        return jsonify({'error': 'sku, rep and positive units required'}), 400
+    db = get_db()
+    _ensure_sales_cmd(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    cur = db.cursor()
+    cur.execute(
+        f"INSERT INTO commission_credits (rep, sku, units, source, "
+        f"store_number, account_id, note) VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph})",
+        (rep, sku, units, (d.get('source') or 'tasting').strip(),
+         d.get('store_number'), d.get('account_id'),
+         (d.get('note') or '').strip()))
+    db.commit()
+    if USE_POSTGRES:
+        cur.close()
+    return jsonify({'status': 'ok', 'credited_units': units})
+
+
+@app.route('/api/sales/commission', methods=['GET'])
+def api_sales_commission():
+    """The bonus tracker a rep opens every morning: per active program, the
+    bottles credited (HORECA orders auto-count + logged tastings/IST), dollars
+    earned, and the remaining stock pool (latest SOD on-hand) still up for
+    grabs — e.g. Rutland Square: $6 × every bottle across the stock."""
+    rep = (request.args.get('rep') or '').strip()
+    db = get_db()
+    _ensure_sales_cmd(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    programs = db_fetchall(
+        "SELECT id, sku, sku_name, per_unit_bonus, rep, notes "
+        "FROM commission_programs WHERE active=1 ORDER BY sku")
+    out = []
+    for pid, sku, sku_name, bonus, prep, notes in programs:
+        if rep and prep and prep.lower() != rep.lower():
+            continue
+        # HORECA orders for this SKU (match sku name OR padded number in sku field)
+        name_like = f"%{(sku_name or 'zzz-no-match').split(' ')[0].lower()}%"
+        orders = db_fetchall(
+            f"SELECT COALESCE(owner_rep,''), COALESCE(expected_units,0), "
+            f"COALESCE(cases,0) FROM deals WHERE stage='ordered' AND "
+            f"(sku={ph} OR LOWER(sku) LIKE {ph})", (sku, name_like))
+        order_units = sum(_order_bottles(u, c) for orep, u, c in orders
+                          if not rep or (orep or '').lower() == rep.lower()
+                          or not (orep or '').strip())
+        credits = db_fetchall(
+            f"SELECT COALESCE(SUM(units),0) FROM commission_credits "
+            f"WHERE sku={ph}" + (f" AND LOWER(rep)={ph}" if rep else ''),
+            (sku, rep.lower()) if rep else (sku,))
+        manual_units = int(credits[0][0] or 0)
+        total_units = order_units + manual_units
+        # Remaining stock pool: latest SOD snapshot on-hand across all stores
+        stock = db_fetchall(
+            f"SELECT COALESCE(SUM(on_hand),0) FROM sod_inventory WHERE sku={ph} "
+            f"AND snapshot_date=(SELECT MAX(snapshot_date) FROM sod_inventory "
+            f"WHERE sku={ph})", (sku, sku))
+        pool = int(stock[0][0] or 0)
+        out.append({
+            'program_id': pid, 'sku': sku, 'sku_name': sku_name,
+            'per_unit_bonus': bonus, 'rep': prep or 'all reps', 'notes': notes,
+            'units_from_orders': order_units, 'units_from_tastings': manual_units,
+            'units_total': total_units,
+            'earned': round(total_units * bonus, 2),
+            'stock_pool_units': pool,
+            'pool_value': round(pool * bonus, 2),
+            'case_assumption': '12 bottles/case when an order logs cases only',
+        })
+    return jsonify({'rep': rep or 'all', 'programs': out})
+
+
+@app.route('/api/horeca/order/<int:deal_id>/payment', methods=['POST'])
+@require_app_origin
+def api_order_payment(deal_id):
+    """Track the money side of an order: unpaid → invoiced → paid."""
+    d = request.get_json(silent=True) or {}
+    status = (d.get('payment_status') or '').strip().lower()
+    if status not in ('unpaid', 'invoiced', 'paid'):
+        return jsonify({'error': "payment_status must be unpaid|invoiced|paid"}), 400
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    cur = db.cursor()
+    if status == 'paid':
+        cur.execute(f"UPDATE deals SET payment_status={ph}, payment_note={ph}, "
+                    f"paid_at=CURRENT_TIMESTAMP WHERE id={ph}",
+                    (status, (d.get('note') or '').strip(), deal_id))
+    else:
+        cur.execute(f"UPDATE deals SET payment_status={ph}, payment_note={ph} "
+                    f"WHERE id={ph}",
+                    (status, (d.get('note') or '').strip(), deal_id))
+    n = cur.rowcount
+    db.commit()
+    if USE_POSTGRES:
+        cur.close()
+    if not n:
+        return jsonify({'error': 'order not found'}), 404
+    return jsonify({'status': 'ok', 'deal_id': deal_id, 'payment_status': status})
+
+
+@app.route('/api/sales/next-best', methods=['GET'])
+def api_sales_next_best():
+    """The rep's 'who do I call RIGHT HERE' list. Pass lat/lng (location
+    access) or address= (typed street/home address, geocoded). Ranks every
+    geocoded account by pipeline value with distance decay and attaches the
+    exact next action."""
+    limit = max(1, min(request.args.get('limit', default=10, type=int), 30))
+    try:
+        lat = float(request.args.get('lat', 0) or 0)
+        lng = float(request.args.get('lng', 0) or 0)
+    except (TypeError, ValueError):
+        lat = lng = 0.0
+    address = (request.args.get('address') or '').strip()
+    if (not lat or not lng) and address:
+        pt = _nominatim_point(address)
+        if pt:
+            lat, lng = pt
+    if not lat or not lng:
+        return jsonify({'error': 'pass lat/lng or address='}), 422
+    db = get_db()
+    _ensure_sales_cmd(db)
+    from datetime import datetime as _dtt, timedelta as _td
+    cutoff = (_dtt.now() - _td(days=14)).strftime('%Y-%m-%d %H:%M:%S')
+    rows = db_fetchall(
+        "SELECT h.id, h.name, h.account_type, h.address, h.city, h.phone, "
+        "h.status, h.priority, COALESCE(h.products_carried,''), h.lat, h.lng, "
+        "(SELECT MAX(d.created_at) FROM deals d WHERE d.horeca_account_id=h.id "
+        " AND d.stage='ordered') AS last_order "
+        "FROM horeca_accounts h WHERE COALESCE(h.lat,0)!=0 AND COALESCE(h.lng,0)!=0 "
+        "AND h.status IN ('customer','tasting','warm','prospect')")
+    scored = []
+    for r in rows:
+        hid, name, kind, addr, city, phone, status, prio, lead, hlat, hlng, last_order = r
+        km = haversine(lat, lng, float(hlat), float(hlng))
+        if km > 30:
+            continue
+        lo = str(last_order or '')
+        if status == 'customer' and lo and lo[:19] <= cutoff:
+            base, action = 100, 'Reorder call: bought before, quiet 14+ days.'
+        elif status == 'customer':
+            base, action = 55, 'Check-in: how is it pouring? Book a staff re-pour.'
+        elif status == 'tasting':
+            base, action = 85, 'Convert the tasting: ask for the first order.'
+        elif prio == 'P1':
+            base, action = 75, f'Priority first pitch. Lead: {lead or "portfolio"}.'
+        elif status == 'warm':
+            base, action = 65, 'Warm follow-up: book the tasting.'
+        else:
+            base, action = 50, f'First pitch. Lead: {lead or "portfolio"}.'
+        score = base - min(km * 4, 40)
+        scored.append({
+            'account_id': hid, 'name': name, 'kind': kind, 'address': addr,
+            'city': city, 'phone': phone, 'status': status, 'priority': prio,
+            'lead_sku': lead, 'km': round(km, 1), 'score': round(score, 1),
+            'action': action,
+            **_venue_links(name, addr, city),
+        })
+    scored.sort(key=lambda x: -x['score'])
+    return jsonify({'origin': {'lat': lat, 'lng': lng},
+                    'count': len(scored[:limit]), 'rows': scored[:limit]})
+
+
+def _top100_build(db, list_key):
+    """Data-driven Top-100: rank licensed venues by category with per-area
+    quotas. Derived list — rebuild replaces prior derived rows (research-
+    sourced rows are preserved)."""
+    ph = '%s' if USE_POSTGRES else '?'
+    cur = db.cursor()
+    cur.execute(f"DELETE FROM target_list_entries WHERE list_key={ph} "
+                f"AND source='data'", (list_key,))
+    rows = db_fetchall(
+        "SELECT licence_number, name, city, region, kind, is_independent, "
+        "COALESCE(phone,''), matched_account_id FROM agco_licensees "
+        "WHERE status IN ('Active','Deemed to Continue')")
+    # cuisine hints from the sweep
+    osm_cuisine = {(_horeca_norm_name(r[0]), (r[1] or '').strip().lower()): (r[2] or '')
+                   for r in db_fetchall("SELECT name, city, cuisine FROM osm_venues")}
+
+    def is_indian(name, city):
+        n = (name or '').lower()
+        if any(k in n for k in _INDIAN_NAME_KEYWORDS):
+            return True
+        cz = osm_cuisine.get((_horeca_norm_name(name), (city or '').strip().lower()), '')
+        return 'indian' in cz.lower()
+
+    cands = []
+    for lic, name, city, region, kind, indep, phone, acct in rows:
+        if list_key == 'indian' and not is_indian(name, city):
+            continue
+        if list_key == 'volume' and kind not in ('hotel', 'banquet', 'club'):
+            cz = osm_cuisine.get((_horeca_norm_name(name), (city or '').strip().lower()), '')
+            if 'cocktail' not in cz.lower():
+                continue
+        if list_key == 'general' and not indep:
+            continue
+        score = (3 if indep else 0) + (2 if region == 'core' else (1 if region == 'gtha' else 0)) \
+            + (1 if phone else 0) + (2 if acct else 0) \
+            + (1 if kind in ('bar', 'club', 'hotel') else 0)
+        cands.append((score, lic, name, city, kind, indep, acct))
+    cands.sort(key=lambda x: (-x[0], x[2]))
+
+    picked, per_area = [], {}
+    for score, lic, name, city, kind, indep, acct in cands:
+        cl = (city or '').strip().lower()
+        area = next((a for a, cities, q in _TOP100_AREAS if cl in cities), None)
+        if area is None:
+            continue
+        quota = next(q for a, cities, q in _TOP100_AREAS if a == area)
+        if per_area.get(area, 0) >= quota:
+            continue
+        per_area[area] = per_area.get(area, 0) + 1
+        picked.append((area, score, lic, name, city, kind, indep, acct))
+        if len(picked) >= 100:
+            break
+    why_by_list = {
+        'indian': 'Indian venue fit: the portfolio IS the menu story here.',
+        'volume': 'High-volume room: banquet/hotel/club scale, standing-order upside.',
+        'general': 'Licensed independent in a priority trade area.',
+    }
+    for i, (area, score, lic, name, city, kind, indep, acct) in enumerate(picked, 1):
+        cur.execute(
+            f"INSERT INTO target_list_entries (list_key, rank, name, city, area, "
+            f"category, why, score, licence_number, account_id, source) "
+            f"VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},'data')",
+            (list_key, i, name, city, area, list_key,
+             why_by_list.get(list_key, ''), score, lic, acct))
+    db.commit()
+    if USE_POSTGRES:
+        cur.close()
+    return len(picked), per_area
+
+
+@app.route('/api/sales/top100/build', methods=['POST'])
+@require_app_origin
+def api_top100_build():
+    d = request.get_json(silent=True) or {}
+    list_key = (d.get('list') or '').strip().lower()
+    if list_key not in ('general', 'indian', 'volume'):
+        return jsonify({'error': "list must be general|indian|volume"}), 400
+    db = get_db()
+    _ensure_sales_cmd(db)
+    _ensure_gtha_sweep(db)
+    n, per_area = _top100_build(db, list_key)
+    return jsonify({'status': 'ok', 'list': list_key, 'entries': n,
+                    'per_area': per_area})
+
+
+@app.route('/api/sales/top100/import', methods=['POST'])
+@require_app_origin
+def api_top100_import():
+    """Merge our own RESEARCHED venue targets into a list (source='research').
+    Matches each name to an AGCO licence where possible. Idempotent by
+    (list, normalized name)."""
+    d = request.get_json(silent=True) or {}
+    list_key = (d.get('list') or '').strip().lower()
+    entries = d.get('entries') or []
+    if list_key not in ('general', 'indian', 'volume') or not entries:
+        return jsonify({'error': 'list + entries required'}), 400
+    db = get_db()
+    _ensure_sales_cmd(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    have = {_horeca_norm_name(r[0]) for r in db_fetchall(
+        f"SELECT name FROM target_list_entries WHERE list_key={ph}", (list_key,))}
+    lic_by_norm = {}
+    for lic, name, city in db_fetchall(
+            "SELECT licence_number, name, city FROM agco_licensees "
+            "WHERE status IN ('Active','Deemed to Continue')"):
+        lic_by_norm.setdefault(_horeca_norm_name(name), (lic, city))
+    cur = db.cursor()
+    added = matched = 0
+    base_rank = (db_fetchall(
+        f"SELECT COALESCE(MAX(rank),0) FROM target_list_entries "
+        f"WHERE list_key={ph}", (list_key,))[0][0] or 0)
+    for e in entries:
+        name = (e.get('name') or '').strip()
+        if not name or _horeca_norm_name(name) in have:
+            continue
+        have.add(_horeca_norm_name(name))
+        hit = lic_by_norm.get(_horeca_norm_name(name))
+        lic = hit[0] if hit else ''
+        if hit:
+            matched += 1
+        base_rank += 1
+        cur.execute(
+            f"INSERT INTO target_list_entries (list_key, rank, name, city, area, "
+            f"category, why, score, licence_number, source) "
+            f"VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},'research')",
+            (list_key, base_rank, name, (e.get('city') or '').strip(),
+             (e.get('area') or '').strip(), (e.get('category') or list_key),
+             (e.get('why') or '').strip(), 10, lic))
+        added += 1
+    db.commit()
+    if USE_POSTGRES:
+        cur.close()
+    return jsonify({'status': 'ok', 'list': list_key, 'added': added,
+                    'licence_matched': matched})
+
+
+@app.route('/api/sales/top100', methods=['GET'])
+def api_top100_get():
+    list_key = (request.args.get('list') or 'general').strip().lower()
+    db = get_db()
+    _ensure_sales_cmd(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    rows = db_fetchall(
+        f"SELECT rank, name, city, area, category, why, score, licence_number, "
+        f"account_id, source FROM target_list_entries WHERE list_key={ph} "
+        f"ORDER BY rank", (list_key,))
+    out = []
+    for r in rows:
+        out.append({'rank': r[0], 'name': r[1], 'city': r[2], 'area': r[3],
+                    'category': r[4], 'why': r[5], 'score': r[6],
+                    'licence_number': r[7], 'account_id': r[8], 'source': r[9],
+                    **_venue_links(r[1], '', r[2])})
+    return jsonify({'list': list_key, 'count': len(out), 'rows': out})
+
+
+@app.route('/api/sales/scoreboard', methods=['GET'])
+def api_sales_scoreboard():
+    """The numbers that matter: points of distribution (LCBO listings + HORECA
+    customers), per-SKU stock + stores, pipeline, bonuses earned."""
+    db = get_db()
+    _ensure_sales_cmd(db)
+    _ensure_listing_ledger(db)
+    lcbo_pods = db_fetchall(
+        "SELECT COUNT(*) FROM store_listings WHERE status='LISTED'")[0][0]
+    horeca_customers = db_fetchall(
+        "SELECT COUNT(*) FROM horeca_accounts WHERE status='customer'")[0][0]
+    per_sku = db_fetchall(
+        "SELECT sku, COUNT(*) FROM store_listings WHERE status='LISTED' GROUP BY sku")
+    sku_stores = {r[0]: r[1] for r in per_sku}
+    stock = db_fetchall(
+        "SELECT sku, SUM(on_hand) FROM sod_inventory WHERE snapshot_date="
+        "(SELECT MAX(snapshot_date) FROM sod_inventory) GROUP BY sku")
+    sku_stock = {r[0]: int(r[1] or 0) for r in stock}
+    pipeline = {r[0]: r[1] for r in db_fetchall(
+        "SELECT status, COUNT(*) FROM horeca_accounts GROUP BY status")}
+    orders_30d = db_fetchall(
+        "SELECT COUNT(*), COALESCE(SUM(cases),0) FROM deals WHERE stage='ordered'")
+    bonus = db_fetchall(
+        "SELECT COALESCE(SUM(c.units * p.per_unit_bonus),0) "
+        "FROM commission_credits c JOIN commission_programs p "
+        "ON p.sku=c.sku AND p.active=1")
+    skus = []
+    for sku, (brand, name) in sorted(SOD_TRACKED_SKUS.items()):
+        skus.append({'sku': sku, 'name': name,
+                     'stores_listed': sku_stores.get(sku, 0),
+                     'stock_units': sku_stock.get(sku, 0)})
+    return jsonify({
+        'points_of_distribution': {
+            'lcbo_store_listings': lcbo_pods,
+            'horeca_customers': horeca_customers,
+            'total': lcbo_pods + horeca_customers,
+        },
+        'per_sku': skus,
+        'pipeline': pipeline,
+        'horeca_orders': {'count': orders_30d[0][0], 'cases': int(orders_30d[0][1] or 0)},
+        'tasting_bonus_earned': round(float(bonus[0][0] or 0), 2),
+    })
+
+
+@app.route('/api/sales/move-bottles', methods=['GET'])
+def api_sales_move_bottles():
+    """Pick a SKU → get THE PLAY: where the stock sits, which stores earn a
+    tasting, which venues to pitch near the stock, which customers to reorder.
+    The system that moves bottles from inside the app."""
+    sku = _pad_sku((request.args.get('sku') or '').strip())
+    if sku not in SOD_TRACKED_SKUS:
+        return jsonify({'error': f'unknown sku; tracked: {sorted(SOD_TRACKED_SKUS)}'}), 400
+    db = get_db()
+    _ensure_sales_cmd(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    brand, name = SOD_TRACKED_SKUS[sku]
+    stock_rows = db_fetchall(
+        f"SELECT i.store_number, i.on_hand, COALESCE(s.account,''), "
+        f"COALESCE(s.city,''), COALESCE(s.lat,0), COALESCE(s.lng,0) "
+        f"FROM sod_inventory i LEFT JOIN stores s ON s.store_number=i.store_number "
+        f"WHERE i.sku={ph} AND i.snapshot_date=(SELECT MAX(snapshot_date) "
+        f"FROM sod_inventory WHERE sku={ph}) AND i.on_hand>0 "
+        f"ORDER BY i.on_hand DESC LIMIT 15", (sku, sku))
+    stock = [{'store_number': r[0], 'on_hand': int(r[1] or 0), 'store': r[2],
+              'city': r[3], 'lat': float(r[4] or 0), 'lng': float(r[5] or 0)}
+             for r in stock_rows]
+    total_stock = sum(s['on_hand'] for s in stock)
+    # Tasting candidates: the deepest-stocked stores (a staff tasting there
+    # clears shelf fastest).
+    tastings = stock[:5]
+    # Pitch venues: geocoded licensed venues within 3km of the top stock stores.
+    pitch = []
+    seen = set()
+    venues = db_fetchall(
+        "SELECT name, city, COALESCE(phone,''), lat, lng, is_independent "
+        "FROM agco_licensees WHERE COALESCE(lat,0)!=0 AND matched_account_id IS NULL")
+    for s in stock[:5]:
+        if not s['lat']:
+            continue
+        near = []
+        for vn, vc, vp, vlat, vlng, vind in venues:
+            if vn in seen:
+                continue
+            km = haversine(s['lat'], s['lng'], float(vlat), float(vlng))
+            if km <= 3:
+                near.append((km, vn, vc, vp, bool(vind)))
+        near.sort()
+        for km, vn, vc, vp, vind in near[:4]:
+            seen.add(vn)
+            pitch.append({'name': vn, 'city': vc, 'phone': vp,
+                          'independent': vind, 'km_from_stock': round(km, 1),
+                          'near_store': s['store_number'],
+                          **_venue_links(vn, '', vc)})
+    # Reorder targets: customers who bought this SKU
+    reorders = db_fetchall(
+        f"SELECT h.id, h.name, h.city, COALESCE(h.phone,''), MAX(d.created_at) "
+        f"FROM deals d JOIN horeca_accounts h ON h.id=d.horeca_account_id "
+        f"WHERE d.stage='ordered' AND (d.sku={ph} OR LOWER(d.sku) LIKE {ph}) "
+        f"GROUP BY h.id, h.name, h.city, h.phone",
+        (sku, f"%{name.split(' ')[0].lower()}%"))
+    return jsonify({
+        'sku': sku, 'brand': brand, 'name': name,
+        'total_stock_units': total_stock,
+        'stock_by_store': stock,
+        'tasting_candidates': tastings,
+        'pitch_venues_near_stock': pitch[:12],
+        'reorder_customers': [
+            {'account_id': r[0], 'name': r[1], 'city': r[2], 'phone': r[3],
+             'last_order': str(r[4] or '')} for r in reorders],
+        'play': (f'1) Book staff tastings at the {len(tastings)} deepest-stock '
+                 f'stores. 2) Pitch the {min(len(pitch),12)} licensed venues '
+                 f'within 3 km of that stock (venue buys at its LCBO). '
+                 f'3) Reorder-call every past buyer. Every bottle logged.'),
+    })
 
 
 _OFFICIAL_STORE_REPS = ('ikshit', 'vaneet', 'ed', 'namit')
