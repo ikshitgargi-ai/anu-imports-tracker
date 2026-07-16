@@ -9823,20 +9823,27 @@ def _generate_daily_actions(conn, rep=None):
             _add('reorder_call', f'Reorder call: {name} ({city})',
                  'Bought before, quiet 14+ days — the cheapest case we can move.',
                  90, account_id=hid, target_name=name)
-    # 2) stagnant deep stock → staff tasting at the store
+    # 2) stagnant deep stock → ONE staff tasting per store (covers every SKU
+    # sitting there). Warehouses/depots are excluded — you cannot pour a staff
+    # tasting at a distribution centre, and their on-hand is reserve stock,
+    # not shelf stock (e.g. #947 Boundary Rd Whitby, #950 London DC).
     cur.execute(
-        "SELECT i.sku, i.store_number, i.on_hand, COALESCE(s.account,''), "
-        "COALESCE(s.address,''), COALESCE(s.city,'') FROM sod_inventory i "
-        "LEFT JOIN stores s ON s.store_number=i.store_number "
+        "SELECT i.store_number, COALESCE(s.account,''), COALESCE(s.address,''), "
+        "COALESCE(s.city,''), SUM(i.on_hand) AS tot, COUNT(DISTINCT i.sku) "
+        "FROM sod_inventory i LEFT JOIN stores s ON s.store_number=i.store_number "
         "WHERE i.snapshot_date=(SELECT MAX(snapshot_date) FROM sod_inventory) "
-        "AND i.on_hand >= 24 ORDER BY i.on_hand DESC LIMIT 20")
-    for sku, sn, on_hand, acct, addr, city in cur.fetchall():
-        nm = SOD_TRACKED_SKUS.get(sku, ('', sku))[1]
+        "AND i.on_hand >= 24 "
+        "GROUP BY i.store_number, s.account, s.address, s.city "
+        "ORDER BY tot DESC LIMIT 12")
+    _DEPOTS = {940, 947, 950, 974}
+    for sn, acct, addr, city, tot, nskus in cur.fetchall():
+        if sn in _DEPOTS or (acct or '').strip().upper().startswith('LCBO #'):
+            continue  # warehouse/depot or directory-less placeholder
         label = ', '.join(x for x in (acct, addr, city) if x)
         _add('store_tasting', f'Book staff tasting: #{sn} {label}',
-             f'{on_hand} bottles of {nm} sitting here — a staff tasting is the '
-             f'fastest shelf-clearer.', 75, sku=sku, store_number=sn,
-             target_name=acct)
+             f'{int(tot)} bottles across {nskus} SKU(s) sitting here — one '
+             f'staff tasting clears the whole shelf fastest.', 75,
+             store_number=sn, target_name=acct)
     # 3) top-100 targets not in the book yet (first pitch)
     cur.execute(
         "SELECT list_key, rank, name, city, area, why FROM target_list_entries "
