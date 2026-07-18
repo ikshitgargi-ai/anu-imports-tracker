@@ -9745,6 +9745,226 @@ def api_sales_move_bottles():
     })
 
 
+# ─── VENUE TYPEAHEAD + QUICK-ADD ────────────────────────────────────────────
+# As-you-type recommendations while logging, from OUR universe (book accounts,
+# 18k AGCO licensees, harvested map venues), instant and legally storable.
+# live=1 adds a Nominatim address lookup for brand-new venues. A Google Places
+# Autocomplete key can be slotted in later (their ToS allows LIVE display,
+# not storage), set GOOGLE_PLACES_KEY and extend _venue_search.
+
+@app.route('/api/horeca/venue-search', methods=['GET'])
+def api_venue_search():
+    """Unified typeahead: q= matches book accounts first (so reps land on the
+    existing record), then licensed venues, then mapped venues. live=1 also
+    geocodes the raw text via Nominatim for a never-seen venue/address."""
+    q = (request.args.get('q') or '').strip()
+    if len(q) < 2:
+        return jsonify({'q': q, 'rows': []})
+    live = request.args.get('live', '').lower() in ('1', 'true', 'yes')
+    db = get_db()
+    _ensure_gtha_sweep(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    like = f'%{q.lower()}%'
+    rows = []
+    for hid, name, city, addr, status in db_fetchall(
+            f"SELECT id, name, COALESCE(city,''), COALESCE(address,''), status "
+            f"FROM horeca_accounts WHERE LOWER(name) LIKE {ph} LIMIT 5", (like,)):
+        rows.append({'kind': 'account', 'account_id': hid, 'name': name,
+                     'city': city, 'address': addr, 'status': status})
+    for lic, name, city, addr, phone in db_fetchall(
+            f"SELECT licence_number, name, COALESCE(city,''), "
+            f"COALESCE(address,''), COALESCE(phone,'') FROM agco_licensees "
+            f"WHERE LOWER(name) LIKE {ph} AND matched_account_id IS NULL "
+            f"AND status IN ('Active','Deemed to Continue') LIMIT 5", (like,)):
+        rows.append({'kind': 'licensee', 'licence_number': lic, 'name': name,
+                     'city': city, 'address': addr, 'phone': phone})
+    for osm_id, name, city, addr, phone in db_fetchall(
+            f"SELECT osm_id, name, COALESCE(city,''), COALESCE(address,''), "
+            f"COALESCE(phone,'') FROM osm_venues WHERE LOWER(name) LIKE {ph} "
+            f"AND matched_licence = '' LIMIT 4", (like,)):
+        if any(_horeca_norm_name(r['name']) == _horeca_norm_name(name)
+               for r in rows):
+            continue
+        rows.append({'kind': 'venue', 'osm_id': osm_id, 'name': name,
+                     'city': city, 'address': addr, 'phone': phone})
+    if live and len(rows) < 3:
+        pt = _nominatim_point(q)
+        if pt:
+            rows.append({'kind': 'address', 'name': q, 'lat': pt[0],
+                         'lng': pt[1],
+                         'note': 'geocoded address, create as new account'})
+    return jsonify({'q': q, 'rows': rows[:12]})
+
+
+@app.route('/api/horeca/quick-add', methods=['POST'])
+@require_app_origin
+def api_horeca_quick_add():
+    """Rep-facing inline account creation when nothing auto-populates.
+    Auto-enriches from a matching licence/mapped venue (address, phone,
+    coords, licence link) and best-effort geocodes a typed address."""
+    d = request.get_json(silent=True) or {}
+    name = (d.get('name') or '').strip()
+    if not name:
+        return jsonify({'error': 'name required'}), 400
+    city = (d.get('city') or '').strip()
+    address = (d.get('address') or '').strip()
+    phone = (d.get('phone') or '').strip()
+    rep = (d.get('rep') or '').strip()
+    db = get_db()
+    _ensure_gtha_sweep(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    # Refuse a silent duplicate, point the rep at the existing account.
+    dupe = db_fetchall(
+        f"SELECT id, name, COALESCE(city,'') FROM horeca_accounts "
+        f"WHERE LOWER(name)={ph}" + (f" AND LOWER(COALESCE(city,''))={ph}" if city else ''),
+        (name.lower(), city.lower()) if city else (name.lower(),))
+    if dupe:
+        return jsonify({'status': 'exists', 'account_id': dupe[0][0],
+                        'name': dupe[0][1], 'city': dupe[0][2]}), 200
+    # Enrich from a licence match (norm name + city when given). Prefilter on
+    # the longest name token so we never pull the whole 18k universe.
+    lic_no, lat, lng = '', 0.0, 0.0
+    norm = _horeca_norm_name(name)
+    tokens = sorted((t for t in norm.split() if len(t) > 2), key=len,
+                    reverse=True)
+    lic_where = "status IN ('Active','Deemed to Continue')"
+    lic_params = ()
+    if tokens:
+        lic_where += f" AND LOWER(name) LIKE {ph}"
+        lic_params = (f'%{tokens[0]}%',)
+    for ln, lname, lcity, laddr, lphone, llat, llng in db_fetchall(
+            f"SELECT licence_number, name, COALESCE(city,''), "
+            f"COALESCE(address,''), COALESCE(phone,''), COALESCE(lat,0), "
+            f"COALESCE(lng,0) FROM agco_licensees WHERE {lic_where}",
+            lic_params):
+        if _horeca_norm_name(lname) == norm and \
+           (not city or lcity.lower() == city.lower()):
+            lic_no = ln
+            address = address or laddr
+            city = city or lcity
+            phone = phone or lphone
+            lat, lng = float(llat or 0), float(llng or 0)
+            break
+    if (not lat or not lng) and address:
+        pt = _nominatim_point(', '.join(x for x in (address, city) if x))
+        if pt:
+            lat, lng = pt
+    cur = db.cursor()
+    ins = (f"INSERT INTO horeca_accounts (name, account_type, address, city, "
+           f"phone, status, priority, rep_name, lat, lng, licence_no, source, "
+           f"notes) VALUES ({ph},{ph},{ph},{ph},{ph},'prospect','P2',{ph},{ph},"
+           f"{ph},{ph},'rep-quick-add',{ph})")
+    note = (f'Added in the field by {rep or "rep"}.' +
+            (f' AGCO licence {lic_no}.' if lic_no else ' Licence not matched yet.'))
+    vals = (name, (d.get('account_type') or 'restaurant').strip(), address,
+            city, phone, rep, lat, lng, lic_no, note)
+    if USE_POSTGRES:
+        cur.execute(ins + ' RETURNING id', vals)
+        hid = cur.fetchone()[0]
+    else:
+        cur.execute(ins, vals)
+        hid = cur.lastrowid
+    if lic_no:
+        cur.execute(f"UPDATE agco_licensees SET matched_account_id={ph} "
+                    f"WHERE licence_number={ph}", (hid, lic_no))
+    db.commit()
+    cur.close()
+    return jsonify({'status': 'created', 'account_id': hid, 'name': name,
+                    'city': city, 'address': address, 'licence_no': lic_no,
+                    'geocoded': bool(lat and lng)})
+
+
+# ─── LCBO VELOCITY + REBALANCE ──────────────────────────────────────────────
+# Cross-SKU sell-through per store from SOD on-hand history: fast movers vs
+# slow/stagnant shelves, and the rebalance play, where the bottles should be.
+
+def _velocity_payload(days, sku_f):
+    """Per store×SKU over `days`: start/end on-hand, estimated units sold
+    (sum of day-over-day decreases, so restocks never count as negative
+    sales), rate/week, days-of-cover, and a class:
+    fast (<=21d cover) / steady / slow (>60d) / stagnant (no movement)."""
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    from datetime import date as _date, timedelta as _td
+    since = (_date.today() - _td(days=days)).isoformat()
+    where = f"snapshot_date >= {ph}"
+    params = [since]
+    if sku_f:
+        where += f" AND sku = {ph}"
+        params.append(sku_f)
+    hist = db_fetchall(
+        f"SELECT sku, store_number, CAST(snapshot_date AS TEXT), on_hand "
+        f"FROM sod_inventory WHERE {where} "
+        f"ORDER BY sku, store_number, snapshot_date", params)
+    series = {}
+    for sku, sn, dt, oh in hist:
+        series.setdefault((sku, sn), []).append((dt, int(oh or 0)))
+    out = []
+    for (sku, sn), pts in series.items():
+        if sku not in SOD_TRACKED_SKUS:
+            continue
+        sold = sum(max(0, pts[i - 1][1] - pts[i][1]) for i in range(1, len(pts)))
+        span_days = max(1, (len(pts) - 1)) if len(pts) > 1 else 1
+        start, end = pts[0][1], pts[-1][1]
+        rate_wk = round(sold / max(days, 1) * 7, 2)
+        cover = round(end / (sold / max(days, 1)), 0) if sold else None
+        if len(pts) < 2 or (sold == 0 and end > 0):
+            klass = 'stagnant'
+        elif cover is not None and cover <= 21:
+            klass = 'fast'
+        elif cover is None or cover > 60:
+            klass = 'slow'
+        else:
+            klass = 'steady'
+        out.append({'sku': sku, 'brand': SOD_TRACKED_SKUS[sku][0],
+                    'product_name': SOD_TRACKED_SKUS[sku][1],
+                    'store_number': sn,
+                    'store_label': _store_label(db, sn),
+                    'start_on_hand': start, 'on_hand': end,
+                    'sold_est': sold, 'rate_per_week': rate_wk,
+                    'days_of_cover': cover, 'class': klass,
+                    'snapshots': len(pts)})
+    out.sort(key=lambda r: (-r['sold_est'], r['sku']))
+    from collections import Counter
+    return {'days': days, 'rows': out[:400],
+            'by_class': dict(Counter(r['class'] for r in out)),
+            'note': ('sold_est sums day-over-day on-hand DECREASES '
+                     'only, so restocks never distort sales')}
+
+
+@app.route('/api/sales/velocity', methods=['GET'])
+def api_sales_velocity():
+    days = max(7, min(request.args.get('days', default=28, type=int), 120))
+    sku_f = _pad_sku((request.args.get('sku') or '').strip())
+    return jsonify(_velocity_payload(days, sku_f))
+
+
+@app.route('/api/sales/rebalance', methods=['GET'])
+def api_sales_rebalance():
+    """The move-stock-between-stores play per SKU: stagnant/slow shelves
+    holding bottles vs fast shelves running dry. LCBO transfers are the
+    buyer's call, so the output is the ACTION plan: tastings at the slow
+    shelves, restock asks for the fast ones, and the evidence to send."""
+    sku = _pad_sku((request.args.get('sku') or '').strip())
+    if sku not in SOD_TRACKED_SKUS:
+        return jsonify({'error': f'unknown sku; tracked: {sorted(SOD_TRACKED_SKUS)}'}), 400
+    rows = _velocity_payload(28, sku)['rows']
+    slow = [r for r in rows if r['class'] in ('slow', 'stagnant') and r['on_hand'] >= 12]
+    fast = [r for r in rows if r['class'] == 'fast' and r['on_hand'] <= 6]
+    slow.sort(key=lambda r: -r['on_hand'])
+    fast.sort(key=lambda r: r['on_hand'])
+    return jsonify({
+        'sku': sku, 'product_name': SOD_TRACKED_SKUS[sku][1],
+        'slow_heavy': slow[:10], 'fast_low': fast[:10],
+        'play': (f'{len(slow)} shelves sitting heavy, {len(fast)} fast shelves '
+                 f'running dry. 1) Staff tastings + displays at the heavy '
+                 f'shelves this week. 2) Flag the fast/low stores to the LCBO '
+                 f'buyer for restock/transfer with this exact evidence. '
+                 f'3) Point HORECA orders at the heavy stores so venue buying '
+                 f'drains them.'),
+    })
+
+
 # ─── CLEARANCE AUTOPILOT ────────────────────────────────────────────────────
 # The sales-manager function, automated: every morning the system reads stock,
 # velocity, the pipeline and the target boards, DECIDES the work, and hands
