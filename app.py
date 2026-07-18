@@ -8146,6 +8146,10 @@ def _ensure_gtha_sweep(db):
     global _GTHA_SWEEP_READY
     if _GTHA_SWEEP_READY:
         return
+    # agco_licensees must exist before we ALTER it. On fresh Postgres the
+    # failed ALTER would roll back the osm CREATEs in the same transaction
+    # and latch the ready flag, bricking every caller until restart.
+    _ensure_horeca_v2(db)
     pk = 'BIGSERIAL PRIMARY KEY' if USE_POSTGRES else 'INTEGER PRIMARY KEY AUTOINCREMENT'
     stmts = [
         '''CREATE TABLE IF NOT EXISTS osm_sweep_tiles (
@@ -9783,10 +9787,14 @@ def _google_autocomplete(q, limit=5):
             if not name:
                 continue
             city = ''
-            parts = [x.strip() for x in addr.split(',') if x.strip()]
+            parts = [x.strip() for x in addr.split(',')
+                     if x.strip() and x.strip().upper() not in ('ON', 'ONTARIO', 'CANADA')]
             if len(parts) >= 2:
-                city = parts[-2] if parts[-1].upper() in ('ON', 'CANADA', 'ON, CANADA') else parts[-1]
-                addr = parts[0]
+                city = parts[-1]
+                addr = ', '.join(parts[:-1])
+            elif len(parts) == 1:
+                city = parts[0]
+                addr = ''
             out.append({'kind': 'google', 'name': name, 'address': addr,
                         'city': city, 'note': 'live Google suggestion'})
         return out
@@ -9861,18 +9869,15 @@ def api_venue_search():
         rows.append({'kind': 'venue', 'osm_id': osm_id, 'name': name,
                      'city': city, 'address': addr, 'phone': phone})
     if live and len(rows) < 8:
+        # Photon/Google are built for as-you-type use. Nominatim is NOT
+        # (its usage policy forbids autocomplete), so it stays out of this
+        # path; quick-add still uses it once per submitted address.
         seen = {_horeca_norm_name(r['name']) for r in rows}
         for s in (_google_autocomplete(q) or _photon_suggest(q)):
             if _horeca_norm_name(s['name']) in seen:
                 continue
             seen.add(_horeca_norm_name(s['name']))
             rows.append(s)
-    if live and len(rows) < 3:
-        pt = _nominatim_point(q)
-        if pt:
-            rows.append({'kind': 'address', 'name': q, 'lat': pt[0],
-                         'lng': pt[1],
-                         'note': 'geocoded address, create as new account'})
     return jsonify({'q': q, 'rows': rows[:12]})
 
 
@@ -9898,6 +9903,12 @@ def api_horeca_quick_add():
         f"SELECT id, name, COALESCE(city,'') FROM horeca_accounts "
         f"WHERE LOWER(name)={ph}" + (f" AND LOWER(COALESCE(city,''))={ph}" if city else ''),
         (name.lower(), city.lower()) if city else (name.lower(),))
+    if dupe and not city and len(dupe) > 1:
+        # Same name in several cities: never guess which one the rep means.
+        return jsonify({'error': 'This name exists in more than one city. '
+                                 'Add the city to continue.',
+                        'candidates': [{'account_id': r[0], 'name': r[1],
+                                        'city': r[2]} for r in dupe[:6]]}), 409
     if dupe:
         return jsonify({'status': 'exists', 'account_id': dupe[0][0],
                         'name': dupe[0][1], 'city': dupe[0][2]}), 200
@@ -9907,24 +9918,30 @@ def api_horeca_quick_add():
     norm = _horeca_norm_name(name)
     tokens = sorted((t for t in norm.split() if len(t) > 2), key=len,
                     reverse=True)
-    lic_where = "status IN ('Active','Deemed to Continue')"
-    lic_params = ()
+    cands = []
     if tokens:
-        lic_where += f" AND LOWER(name) LIKE {ph}"
-        lic_params = (f'%{tokens[0]}%',)
-    for ln, lname, lcity, laddr, lphone, llat, llng in db_fetchall(
-            f"SELECT licence_number, name, COALESCE(city,''), "
-            f"COALESCE(address,''), COALESCE(phone,''), COALESCE(lat,0), "
-            f"COALESCE(lng,0) FROM agco_licensees WHERE {lic_where}",
-            lic_params):
-        if _horeca_norm_name(lname) == norm and \
-           (not city or lcity.lower() == city.lower()):
-            lic_no = ln
-            address = address or laddr
-            city = city or lcity
-            phone = phone or lphone
-            lat, lng = float(llat or 0), float(llng or 0)
-            break
+        # No usable token means no prefilter is possible; skip enrichment
+        # rather than pull the whole 18k universe per request.
+        for row in db_fetchall(
+                f"SELECT licence_number, name, COALESCE(city,''), "
+                f"COALESCE(address,''), COALESCE(phone,''), COALESCE(lat,0), "
+                f"COALESCE(lng,0) FROM agco_licensees "
+                f"WHERE status IN ('Active','Deemed to Continue') "
+                f"AND matched_account_id IS NULL AND LOWER(name) LIKE {ph}",
+                (f'%{tokens[0]}%',)):
+            if _horeca_norm_name(row[1]) == norm:
+                cands.append(row)
+    if city:
+        cands = [r for r in cands if r[2].lower() == city.lower()]
+    # Without a city, a chain licensed in several cities is ambiguous:
+    # attach a licence only when the match is unique.
+    if cands and (city or len(cands) == 1):
+        ln, lname, lcity, laddr, lphone, llat, llng = cands[0]
+        lic_no = ln
+        address = address or laddr
+        city = city or lcity
+        phone = phone or lphone
+        lat, lng = float(llat or 0), float(llng or 0)
     if (not lat or not lng) and address:
         pt = _nominatim_point(', '.join(x for x in (address, city) if x))
         if pt:
@@ -9984,11 +10001,21 @@ def _velocity_payload(days, sku_f):
         if sku not in SOD_TRACKED_SKUS:
             continue
         sold = sum(max(0, pts[i - 1][1] - pts[i][1]) for i in range(1, len(pts)))
-        span_days = max(1, (len(pts) - 1)) if len(pts) > 1 else 1
         start, end = pts[0][1], pts[-1][1]
-        rate_wk = round(sold / max(days, 1) * 7, 2)
-        cover = round(end / (sold / max(days, 1)), 0) if sold else None
-        if len(pts) < 2 or (sold == 0 and end > 0):
+        # Rate divides by the CALENDAR span the data actually covers, not the
+        # requested window, so a listing that starts mid-window is never
+        # diluted into a false 'slow'.
+        try:
+            span_days = max((_date.fromisoformat(pts[-1][0][:10])
+                             - _date.fromisoformat(pts[0][0][:10])).days, 1)
+        except ValueError:
+            span_days = max(len(pts) - 1, 1)
+        daily = sold / span_days
+        rate_wk = round(daily * 7, 2)
+        cover = round(end / daily, 0) if sold else None
+        if sold == 0 and end == 0:
+            klass = 'out'
+        elif len(pts) < 2 or (sold == 0 and end > 0):
             klass = 'stagnant'
         elif cover is not None and cover <= 21:
             klass = 'fast'

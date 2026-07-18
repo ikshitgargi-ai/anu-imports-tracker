@@ -101,11 +101,20 @@ class TestVenueSearch:
         sym = next(x for x in lic if x['name'] == 'SPICE SYMPHONY')
         assert sym['address'] == '10 GERRARD ST' and sym['phone'] == '416-555-9001'
 
-    def test_live_geocode_fallback(self, seeded, client):
-        rows = client.get(
-            '/api/horeca/venue-search?q=geocodable%20new%20place&live=1'
-        ).get_json()['rows']
-        assert any(r['kind'] == 'address' and r['lat'] == 43.70 for r in rows)
+    def test_typeahead_never_calls_nominatim(self, seeded, client, app_module):
+        # Nominatim's usage policy forbids autocomplete; the live layer must
+        # use Photon/Google only. Tripwire raises if the old path returns.
+        orig = app_module._nominatim_point
+
+        def tripwire(q):
+            raise AssertionError('nominatim called from typeahead')
+        app_module._nominatim_point = tripwire
+        try:
+            r = client.get('/api/horeca/venue-search?q=zzz%20noplace&live=1')
+            assert r.status_code == 200
+            assert all(x['kind'] != 'address' for x in r.get_json()['rows'])
+        finally:
+            app_module._nominatim_point = orig
 
 
 class TestLiveLayers:
@@ -165,6 +174,63 @@ class TestQuickAdd:
             'city': 'Toronto', 'rep': 'Namit'})
         assert r.get_json()['geocoded'] is True
 
+    def test_never_steals_matched_licence(self, seeded, client, app_module):
+        # A licence already linked to an account must NOT be re-pointed by a
+        # later quick-add of the same venue name.
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            first = db.execute("SELECT matched_account_id FROM agco_licensees "
+                               "WHERE licence_number='LSL90003'").fetchone()[0]
+        assert first is not None    # linked by the Maple Tavern test above
+        r = client.post('/api/horeca/quick-add', json={
+            'name': 'Maple Tavern 2nd Location', 'city': 'Brampton'})
+        assert r.get_json().get('licence_no', '') == ''
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            still = db.execute("SELECT matched_account_id FROM agco_licensees "
+                               "WHERE licence_number='LSL90003'").fetchone()[0]
+        assert still == first
+
+    def test_no_city_chain_is_ambiguous_not_guessed(self, seeded, client,
+                                                    app_module):
+        # Chain licensed in two cities + no city typed: no licence attached.
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            for ln, ct in (('LSL90008', 'TORONTO'), ('LSL90009', 'OAKVILLE')):
+                db.execute("INSERT INTO agco_licensees (licence_number, name, "
+                           "city, status) VALUES (?, 'CHAI CHAIN', ?, 'Active')",
+                           (ln, ct))
+            db.commit()
+        r = client.post('/api/horeca/quick-add', json={'name': 'Chai Chain'})
+        body = r.get_json()
+        assert body['status'] == 'created' and body['licence_no'] == ''
+
+    def test_duplicate_across_cities_asks_for_city(self, seeded, client,
+                                                   app_module):
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            db.execute("INSERT INTO horeca_accounts (name, city) VALUES "
+                       "('Twin House','Toronto')")
+            db.execute("INSERT INTO horeca_accounts (name, city) VALUES "
+                       "('Twin House','Brampton')")
+            db.commit()
+        r = client.post('/api/horeca/quick-add', json={'name': 'Twin House'})
+        assert r.status_code == 409
+        assert len(r.get_json()['candidates']) == 2
+
+
+class TestGoogleParse:
+    def test_city_never_becomes_province(self, app_module):
+        parts_in = 'Toronto, ON, Canada'
+        parts = [x.strip() for x in parts_in.split(',')
+                 if x.strip() and x.strip().upper() not in ('ON', 'ONTARIO', 'CANADA')]
+        assert parts == ['Toronto']
+        # and through the real parser shape: secondaryText with street
+        addr = '123 Queen St W, Toronto, ON, Canada'
+        parts = [x.strip() for x in addr.split(',')
+                 if x.strip() and x.strip().upper() not in ('ON', 'ONTARIO', 'CANADA')]
+        assert parts[-1] == 'Toronto' and parts[0] == '123 Queen St W'
+
 
 class TestVelocity:
     def test_all_skus_view_not_empty(self, seeded, client):
@@ -186,6 +252,35 @@ class TestVelocity:
             f'/api/sales/velocity?days=28&sku={RUTLAND}').get_json()['rows']
         sleepy = next(r for r in rows if r['store_number'] == 601)
         assert sleepy['sold_est'] == 0 and sleepy['class'] == 'stagnant'
+
+    def test_rate_uses_observed_span_not_window(self, seeded, client):
+        # 18 sold across a 12-day span = 1.5/day = 10.5/wk, cover 24/1.5 = 16d
+        # -> 'fast'. Dividing by the 28-day WINDOW would say 4.5/wk, cover 37
+        # -> 'steady'/'slow' and hide a restock risk.
+        rows = client.get(
+            f'/api/sales/velocity?days=28&sku={RUTLAND}').get_json()['rows']
+        fast = next(r for r in rows if r['store_number'] == 555)
+        assert fast['rate_per_week'] == 10.5
+        assert fast['days_of_cover'] == 16
+        assert fast['class'] == 'fast'
+
+    def test_empty_dead_shelf_is_out_not_slow(self, seeded, client,
+                                              app_module):
+        from datetime import date, timedelta
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            today = date.today()
+            for i in range(3):
+                d = (today - timedelta(days=(2 - i) * 3)).isoformat()
+                db.execute("INSERT INTO sod_inventory (sku, store_number, "
+                           "snapshot_date, status, on_hand, product_name) "
+                           "VALUES (?, 602, ?, 'L', 0, 'Rutland Square')",
+                           (RUTLAND, d))
+            db.commit()
+        rows = client.get(
+            f'/api/sales/velocity?days=28&sku={RUTLAND}').get_json()['rows']
+        dead = next(r for r in rows if r['store_number'] == 602)
+        assert dead['class'] == 'out'
 
 
 class TestRebalance:
