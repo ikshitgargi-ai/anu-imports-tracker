@@ -9752,6 +9752,79 @@ def api_sales_move_bottles():
 # Autocomplete key can be slotted in later (their ToS allows LIVE display,
 # not storage), set GOOGLE_PLACES_KEY and extend _venue_search.
 
+GOOGLE_PLACES_KEY = os.environ.get('GOOGLE_PLACES_KEY', '').strip()
+
+
+def _google_autocomplete(q, limit=5):
+    """Live Google Places Autocomplete (New API). Display-and-autofill use,
+    which Google permits; we store only the name/address the rep confirms
+    into the form, never place details. Inert until GOOGLE_PLACES_KEY is set
+    (free tier: 10k autocomplete calls/month)."""
+    if not GOOGLE_PLACES_KEY or http_requests is None:
+        return []
+    try:
+        resp = http_requests.post(
+            'https://places.googleapis.com/v1/places:autocomplete',
+            json={'input': q,
+                  'locationBias': {'circle': {
+                      'center': {'latitude': 43.70, 'longitude': -79.40},
+                      'radius': 50000.0}},
+                  'includedRegionCodes': ['ca']},
+            headers={'X-Goog-Api-Key': GOOGLE_PLACES_KEY,
+                     'Content-Type': 'application/json'},
+            timeout=8)
+        resp.raise_for_status()
+        out = []
+        for s in (resp.json().get('suggestions') or [])[:limit]:
+            p = s.get('placePrediction') or {}
+            fmt = p.get('structuredFormat') or {}
+            name = (fmt.get('mainText') or {}).get('text', '')
+            addr = (fmt.get('secondaryText') or {}).get('text', '')
+            if not name:
+                continue
+            city = ''
+            parts = [x.strip() for x in addr.split(',') if x.strip()]
+            if len(parts) >= 2:
+                city = parts[-2] if parts[-1].upper() in ('ON', 'CANADA', 'ON, CANADA') else parts[-1]
+                addr = parts[0]
+            out.append({'kind': 'google', 'name': name, 'address': addr,
+                        'city': city, 'note': 'live Google suggestion'})
+        return out
+    except Exception:
+        return []
+
+
+def _photon_suggest(q, limit=5):
+    """Live as-you-type venue/address suggestions from Photon (komoot),
+    the key-less OSM geocoder. ODbL data, legal to store, biased to the
+    GTHA. The free live-maps layer under the Google branch."""
+    if http_requests is None:
+        return []
+    try:
+        resp = http_requests.get(
+            'https://photon.komoot.io/api/',
+            params={'q': q, 'limit': limit, 'lat': 43.70, 'lon': -79.40},
+            headers={'User-Agent': _PROSPECT_UA}, timeout=8)
+        resp.raise_for_status()
+        out = []
+        for f in (resp.json().get('features') or []):
+            pr = f.get('properties') or {}
+            name = pr.get('name') or ''
+            if not name or (pr.get('countrycode') or '').upper() not in ('CA', ''):
+                continue
+            addr = ' '.join(x for x in (pr.get('housenumber'), pr.get('street'))
+                            if x)
+            coords = (f.get('geometry') or {}).get('coordinates') or []
+            out.append({'kind': 'venue', 'name': name, 'address': addr,
+                        'city': pr.get('city') or pr.get('district') or '',
+                        'lat': coords[1] if len(coords) == 2 else None,
+                        'lng': coords[0] if len(coords) == 2 else None,
+                        'note': 'live map suggestion'})
+        return out
+    except Exception:
+        return []
+
+
 @app.route('/api/horeca/venue-search', methods=['GET'])
 def api_venue_search():
     """Unified typeahead: q= matches book accounts first (so reps land on the
@@ -9787,6 +9860,13 @@ def api_venue_search():
             continue
         rows.append({'kind': 'venue', 'osm_id': osm_id, 'name': name,
                      'city': city, 'address': addr, 'phone': phone})
+    if live and len(rows) < 8:
+        seen = {_horeca_norm_name(r['name']) for r in rows}
+        for s in (_google_autocomplete(q) or _photon_suggest(q)):
+            if _horeca_norm_name(s['name']) in seen:
+                continue
+            seen.add(_horeca_norm_name(s['name']))
+            rows.append(s)
     if live and len(rows) < 3:
         pt = _nominatim_point(q)
         if pt:
@@ -9935,8 +10015,10 @@ def _velocity_payload(days, sku_f):
 @app.route('/api/sales/velocity', methods=['GET'])
 def api_sales_velocity():
     days = max(7, min(request.args.get('days', default=28, type=int), 120))
-    sku_f = _pad_sku((request.args.get('sku') or '').strip())
-    return jsonify(_velocity_payload(days, sku_f))
+    raw = (request.args.get('sku') or '').strip()
+    # _pad_sku('') zero-pads to '0000000', which would silently filter the
+    # all-SKUs view down to nothing, so only pad a real value.
+    return jsonify(_velocity_payload(days, _pad_sku(raw) if raw else ''))
 
 
 @app.route('/api/sales/rebalance', methods=['GET'])

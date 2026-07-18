@@ -31,8 +31,9 @@ def app_module():
         'app', os.path.join(os.path.dirname(__file__), '..', 'app.py'))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    # never hit the real Nominatim in tests
+    # never hit the real Nominatim/Photon/Google in tests
     mod._nominatim_point = lambda q: (43.70, -79.40) if 'geocodable' in q.lower() else None
+    mod._photon_suggest = lambda q, limit=5: []
     return mod
 
 
@@ -107,6 +108,29 @@ class TestVenueSearch:
         assert any(r['kind'] == 'address' and r['lat'] == 43.70 for r in rows)
 
 
+class TestLiveLayers:
+    def test_google_branch_inert_without_key(self, app_module):
+        assert app_module.GOOGLE_PLACES_KEY == ''
+        assert app_module._google_autocomplete('spice') == []
+
+    def test_live_suggestions_merged_and_deduped(self, seeded, client, app_module):
+        orig = app_module._photon_suggest
+        app_module._photon_suggest = lambda q, limit=5: [
+            {'kind': 'venue', 'name': 'SPICE SYMPHONY', 'address': 'dupe',
+             'city': 'Toronto', 'note': 'live map suggestion'},
+            {'kind': 'venue', 'name': 'Totally New Bar', 'address': '9 New St',
+             'city': 'Toronto', 'note': 'live map suggestion'},
+        ]
+        try:
+            rows = client.get(
+                '/api/horeca/venue-search?q=spice&live=1').get_json()['rows']
+            names = [r['name'] for r in rows]
+            assert 'Totally New Bar' in names          # live result merged in
+            assert names.count('SPICE SYMPHONY') == 1  # dupe vs licensee dropped
+        finally:
+            app_module._photon_suggest = orig
+
+
 class TestQuickAdd:
     def test_requires_name(self, seeded, client):
         assert client.post('/api/horeca/quick-add', json={}).status_code == 400
@@ -143,6 +167,12 @@ class TestQuickAdd:
 
 
 class TestVelocity:
+    def test_all_skus_view_not_empty(self, seeded, client):
+        # Regression: _pad_sku('') zero-pads to '0000000', which silently
+        # filtered the no-sku (all SKUs) view down to zero rows on prod.
+        rows = client.get('/api/sales/velocity?days=28').get_json()['rows']
+        assert {r['store_number'] for r in rows} >= {555, 601}
+
     def test_restock_never_counts_negative(self, seeded, client):
         rows = client.get(
             f'/api/sales/velocity?days=28&sku={RUTLAND}').get_json()['rows']
