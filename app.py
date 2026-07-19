@@ -10076,6 +10076,288 @@ def api_sales_rebalance():
     })
 
 
+# ─── ALWAYS-ON SPINE: HEARTBEAT + PERMANENT STORE COVERAGE ──────────────────
+# Two guarantees the business depends on:
+#   1. Every store we touch is recorded FOREVER, in an append-only ledger that
+#      survives any single table being wrong, re-imported, or replaced.
+#   2. Every background job PROVES it ran. The backup job in this codebase once
+#      failed silently for weeks because nothing checked whether it reported
+#      in. Jobs now check in on success; the heartbeat endpoint compares each
+#      job's last check-in against its expected cadence and says so loudly.
+
+_SPINE_READY = False
+
+# job name -> (how often it should check in (hours), what it does)
+_HEARTBEAT_EXPECT = {
+    'sod_ingest':     (30, 'LCBO stock feed ingest'),
+    'backup':         (30, 'off-site backup of every table'),
+    'live_scrape':    (30, 'lcbo.com live inventory check'),
+    'autopilot':      (30, 'daily action queue generation'),
+    'health_check':   (14, 'internal health probe'),
+    'coverage_fold':  (30, 'store-coverage ledger fold'),
+}
+
+
+def _ensure_spine(db):
+    global _SPINE_READY
+    if _SPINE_READY:
+        return
+    pk = 'BIGSERIAL PRIMARY KEY' if USE_POSTGRES else 'INTEGER PRIMARY KEY AUTOINCREMENT'
+    stmts = [
+        # Append-only. One row per store touch, forever. Never updated, never
+        # deleted; a correction is a new row, not an edit.
+        f'''CREATE TABLE IF NOT EXISTS store_coverage (
+               id {pk},
+               store_number INTEGER NOT NULL,
+               touched_on TEXT NOT NULL,
+               touch_type TEXT NOT NULL,
+               rep TEXT DEFAULT '',
+               source TEXT NOT NULL,
+               source_ref TEXT DEFAULT '',
+               sku TEXT DEFAULT '',
+               bottles INTEGER DEFAULT 0,
+               note TEXT DEFAULT '',
+               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
+        # One row per job run. Success only: absence IS the alarm.
+        f'''CREATE TABLE IF NOT EXISTS system_heartbeat (
+               id {pk},
+               job TEXT NOT NULL,
+               ok INTEGER DEFAULT 1,
+               detail TEXT DEFAULT '',
+               ran_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_cov_unique ON store_coverage'
+        '(store_number, touched_on, touch_type, source, source_ref)',
+        'CREATE INDEX IF NOT EXISTS idx_cov_store ON store_coverage(store_number)',
+        'CREATE INDEX IF NOT EXISTS idx_hb_job ON system_heartbeat(job, ran_at)',
+    ]
+    cur = db.cursor()
+    for s in stmts:
+        try:
+            cur.execute(s)
+        except Exception:
+            db.rollback()
+    db.commit()
+    cur.close()
+    _SPINE_READY = True
+
+
+def _heartbeat(conn, job, ok=True, detail=''):
+    """Called by every scheduled job on completion. Takes a connection so it
+    works from a bare scheduler thread with no Flask context."""
+    try:
+        ph = '%s' if USE_POSTGRES else '?'
+        cur = conn.cursor()
+        cur.execute(f"INSERT INTO system_heartbeat (job, ok, detail) "
+                    f"VALUES ({ph},{ph},{ph})", (job, 1 if ok else 0,
+                                                 str(detail)[:500]))
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        print(f'[heartbeat] could not record {job}: {e}')
+
+
+def _fold_store_coverage(db):
+    """Fold every source of store contact into the permanent ledger.
+    Idempotent: the unique index means re-running can never double-count.
+    Sources today: rep activities, outreach touches, SOD-confirmed listings."""
+    _ensure_spine(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    cur = db.cursor()
+    added = 0
+    # 1) Rep activities (visits, tastings, shelf checks)
+    try:
+        rows = db_fetchall(
+            "SELECT a.id, s.store_number, COALESCE(CAST(a.created_at AS TEXT),''), COALESCE(a.activity_type,''), COALESCE(r.name,'') FROM activities a JOIN stores s ON s.id = a.store_id LEFT JOIN reps r ON r.id = a.rep_id")
+        for aid, sn, ts, atype, rep in rows:
+            if not sn or not ts:
+                continue
+            try:
+                cur.execute(
+                    f"INSERT INTO store_coverage (store_number, touched_on, "
+                    f"touch_type, rep, source, source_ref) VALUES "
+                    f"({ph},{ph},{ph},{ph},'activity',{ph})",
+                    (int(sn), ts[:10], atype or 'visit', rep, str(aid)))
+                added += 1
+            except Exception:
+                db.rollback()   # duplicate: already folded
+        db.commit()          # bank the activity rows before touching outreach
+    except Exception:
+        db.rollback()
+    # 2) Outreach touches that name a store
+    try:
+        rows = db_fetchall(
+            "SELECT id, account_id, COALESCE(CAST(created_at AS TEXT),''), "
+            "channel, COALESCE(rep,''), COALESCE(bottles_moved,0) "
+            "FROM outreach_log WHERE blocked_reason = ''")
+        for oid, acct, ts, ch, rep, btl in rows:
+            if not acct or not ts:
+                continue
+            try:
+                cur.execute(
+                    f"INSERT INTO store_coverage (store_number, touched_on, "
+                    f"touch_type, rep, source, source_ref, bottles) VALUES "
+                    f"({ph},{ph},{ph},{ph},'outreach',{ph},{ph})",
+                    (int(acct), ts[:10], ch, rep, str(oid), int(btl or 0)))
+                added += 1
+            except Exception:
+                db.rollback()
+    except Exception:
+        db.rollback()
+    db.commit()
+    cur.close()
+    return added
+
+
+def _fold_store_coverage_conn(conn):
+    """Scheduler-safe fold. Cursor-only, no Flask g, no db_fetchall: bare
+    APScheduler threads have no app context, which is exactly how the daily
+    backup died silently once already."""
+    _ensure_spine(conn)
+    ph = '%s' if USE_POSTGRES else '?'
+    cur = conn.cursor()
+    added = 0
+    for sql, source, unpack in (
+        ("SELECT a.id, s.store_number, COALESCE(CAST(a.created_at AS TEXT),''), COALESCE(a.activity_type,''), COALESCE(r.name,'') FROM activities a JOIN stores s ON s.id = a.store_id LEFT JOIN reps r ON r.id = a.rep_id", 'activity', 'act'),
+        ("SELECT id, account_id, COALESCE(CAST(created_at AS TEXT),''), "
+         "channel, COALESCE(rep,''), COALESCE(bottles_moved,0) "
+         "FROM outreach_log WHERE blocked_reason = ''", 'outreach', 'out'),
+    ):
+        try:
+            cur.execute(sql)
+            rows = cur.fetchall()
+        except Exception:
+            conn.rollback()
+            continue
+        for row in rows:
+            try:
+                if unpack == 'act':
+                    rid, sn, ts, ttype, rep = row
+                    btl = 0
+                else:
+                    rid, sn, ts, ttype, rep, btl = row
+                if not sn or not ts:
+                    continue
+                cur.execute(
+                    f"INSERT INTO store_coverage (store_number, touched_on, "
+                    f"touch_type, rep, source, source_ref, bottles) VALUES "
+                    f"({ph},{ph},{ph},{ph},{ph},{ph},{ph})",
+                    (int(sn), str(ts)[:10], ttype or 'visit', rep or '',
+                     source, str(rid), int(btl or 0)))
+                added += 1
+            except Exception:
+                conn.rollback()   # already folded, or bad row: skip it
+        conn.commit()             # bank each source independently
+    conn.commit()
+    cur.close()
+    return added
+
+
+@app.route('/api/system/heartbeat', methods=['GET'])
+def api_system_heartbeat():
+    """The one screen that proves the machine is alive.
+
+    Every scheduled job reports in on success. A job that has not reported
+    within its expected window is shown as STALE or DEAD, loudly, because
+    silence is exactly how the backup failure hid for weeks.
+    """
+    db = get_db()
+    _ensure_spine(db)
+    from datetime import datetime as _dt
+    now = _dt.utcnow()
+    jobs = []
+    worst = 'OK'
+    for job, (max_hours, what) in sorted(_HEARTBEAT_EXPECT.items()):
+        rows = db_fetchall(
+            "SELECT CAST(ran_at AS TEXT), ok, COALESCE(detail,'') "
+            "FROM system_heartbeat WHERE job = " +
+            ('%s' if USE_POSTGRES else '?') +
+            " ORDER BY ran_at DESC LIMIT 1", (job,))
+        if not rows:
+            state, age = 'NEVER RAN', None
+        else:
+            ts, ok, detail = rows[0]
+            try:
+                last = _dt.fromisoformat(str(ts)[:19].replace('T', ' '))
+                age = round((now - last).total_seconds() / 3600, 1)
+            except (ValueError, TypeError):
+                age = None
+            if not ok:
+                state = 'FAILED'
+            elif age is None:
+                state = 'UNKNOWN'
+            elif age > max_hours * 2:
+                state = 'DEAD'
+            elif age > max_hours:
+                state = 'STALE'
+            else:
+                state = 'OK'
+        rank = {'OK': 0, 'UNKNOWN': 1, 'STALE': 2, 'NEVER RAN': 3,
+                'FAILED': 3, 'DEAD': 3}
+        if rank.get(state, 0) > rank.get(worst, 0):
+            worst = state
+        jobs.append({'job': job, 'does': what, 'state': state,
+                     'hours_since_last_run': age,
+                     'expected_within_hours': max_hours})
+    # Permanent-record counts: the numbers that must only ever go up.
+    def _count(sql):
+        try:
+            r = db_fetchall(sql)
+            return int(r[0][0]) if r else 0
+        except Exception:
+            db.rollback()
+            return -1
+    return jsonify({
+        'overall': 'OK' if worst == 'OK' else f'ATTENTION: {worst}',
+        'jobs': jobs,
+        'permanent_records': {
+            'listing_ledger_rows': _count('SELECT COUNT(*) FROM listing_ledger'),
+            'stores_ever_touched': _count(
+                'SELECT COUNT(DISTINCT store_number) FROM store_coverage'),
+            'store_touches_logged': _count('SELECT COUNT(*) FROM store_coverage'),
+            'outreach_touches_logged': _count('SELECT COUNT(*) FROM outreach_log'),
+            'suppression_list': _count('SELECT COUNT(*) FROM outreach_suppression'),
+        },
+        'note': 'jobs report in on success; silence is the alarm. Every count '
+                'here is append-only and must only ever increase.',
+    })
+
+
+@app.route('/api/system/coverage', methods=['GET'])
+def api_system_coverage():
+    """Stores touched, ever. The permanent answer to "have we been there?"."""
+    db = get_db()
+    _ensure_spine(db)
+    days = request.args.get('days', type=int)
+    ph = '%s' if USE_POSTGRES else '?'
+    where, params = '', ()
+    if days:
+        from datetime import date as _d, timedelta as _td
+        where = f" WHERE touched_on >= {ph}"
+        params = ((_d.today() - _td(days=days)).isoformat(),)
+    rows = db_fetchall(
+        f"SELECT store_number, COUNT(*), MAX(touched_on), "
+        f"COALESCE(SUM(bottles),0) FROM store_coverage{where} "
+        f"GROUP BY store_number ORDER BY MAX(touched_on) DESC", params)
+    out = [{'store_number': sn, 'store_label': _store_label(db, sn),
+            'touches': int(n or 0), 'last_touched': last,
+            'bottles_logged': int(b or 0)} for sn, n, last, b in rows]
+    total_stores = db_fetchall("SELECT COUNT(*) FROM stores")
+    total = int(total_stores[0][0]) if total_stores else 0
+    return jsonify({'stores_touched': len(out), 'stores_total': total,
+                    'coverage_pct': round(len(out) / total * 100, 1) if total else 0,
+                    'rows': out[:500],
+                    'window_days': days or 'all time'})
+
+
+@app.route('/api/system/coverage/fold', methods=['POST'])
+@require_app_origin
+def api_system_coverage_fold():
+    db = get_db()
+    added = _fold_store_coverage(db)
+    _heartbeat(db, 'coverage_fold', True, f'{added} new touches folded')
+    return jsonify({'status': 'folded', 'new_touches': added})
+
+
 # ─── OUTREACH ENGINE: CONSENT, SUPPRESSION, TOUCH LOG ───────────────────────
 # Built after a real incident: ~400 cold emails a day went out in batches AND
 # a venue that asked to be removed kept receiving them. Under CASL that is the
@@ -10741,9 +11023,18 @@ def _autopilot_daily():
     conn = None
     try:
         conn = _sod_get_conn()
+        _ensure_spine(conn)
         n = _generate_daily_actions(conn)
         if n:
             print(f'[AUTOPILOT] queued {n} actions')
+        # Fold coverage on the same pass so the permanent store record is
+        # never more than a day behind, then report in.
+        try:
+            _fold_store_coverage_conn(conn)
+            _heartbeat(conn, 'coverage_fold', True, 'folded with autopilot')
+        except Exception as ce:
+            print(f'[AUTOPILOT] coverage fold skipped: {ce}')
+        _heartbeat(conn, 'autopilot', True, f'{n} actions queued')
     except Exception as ex:
         print(f'[AUTOPILOT] skipped (self-heals tomorrow): {ex}')
     finally:
@@ -16317,6 +16608,14 @@ def start_backup_scheduler():
             try:
                 payload = _build_essential_backup()
                 ok = _send_backup_email(payload)
+                try:
+                    _bc = _sod_get_conn()
+                    _ensure_spine(_bc)
+                    _heartbeat(_bc, 'backup', bool(ok),
+                               'emailed' if ok else 'send failed')
+                    _bc.close()
+                except Exception:
+                    pass
                 if not ok:
                     send_alert(
                         subject="Daily backup failed to send",
