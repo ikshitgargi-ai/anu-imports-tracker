@@ -10076,6 +10076,490 @@ def api_sales_rebalance():
     })
 
 
+# ─── OUTREACH ENGINE: CONSENT, SUPPRESSION, TOUCH LOG ───────────────────────
+# Built after a real incident: ~400 cold emails a day went out in batches AND
+# a venue that asked to be removed kept receiving them. Under CASL that is the
+# clearest kind of violation, so the design rule here is structural, not
+# procedural: there is ONE gate (_outreach_gate) and every send path must pass
+# it. Suppression is permanent and is never deleted. Caps are enforced in the
+# same gate so no caller can opt out of them.
+#
+# Channel note: CASL governs commercial ELECTRONIC messages. A phone call or a
+# walk-in is a different regime (and is what actually moves bottles), so the
+# team queues below deliberately rank visits and calls above email.
+
+_OUTREACH_READY = False
+
+# Conservative daily ceilings. Cold email is the smallest number on purpose:
+# it is the channel that carries legal risk and, on our own evidence, moved
+# the fewest bottles.
+_OUTREACH_DAILY_CAP = {'email': 25, 'call': 60, 'visit': 20, 'whatsapp': 15,
+                       'sms': 15, 'dm': 15}
+
+# CASL is technology-neutral: a WhatsApp/SMS/Instagram DM to a bar manager is
+# legally identical to a cold email (CASL s.1(1), CRTC CASL FAQ). All of these
+# go through the consent gate.
+_ELECTRONIC_CHANNELS = ('email', 'whatsapp', 'sms', 'dm')
+
+_CONSENT_KINDS = ('express', 'implied_published', 'implied_business',
+                  'b2b_relationship', 'referral', 'none', 'withdrawn')
+
+# An unsubscribe must be honoured without delay and in any case within 10
+# BUSINESS days, and the mechanism must stay live 60 days (CASL s.11).
+# We honour instantly, which is the only sane engineering answer.
+_UNSUB_HONOUR_BUSINESS_DAYS = 10
+_UNSUB_MECHANISM_VALID_DAYS = 60
+
+
+def _ensure_outreach(db):
+    global _OUTREACH_READY
+    if _OUTREACH_READY:
+        return
+    _ensure_horeca_v2(db)
+    pk = 'BIGSERIAL PRIMARY KEY' if USE_POSTGRES else 'INTEGER PRIMARY KEY AUTOINCREMENT'
+    stmts = [
+        # Consent per destination. Evidence is mandatory in practice: if we
+        # cannot say WHERE consent came from, we treat it as none.
+        f'''CREATE TABLE IF NOT EXISTS outreach_consent (
+               id {pk},
+               destination TEXT NOT NULL,
+               channel TEXT NOT NULL DEFAULT 'email',
+               account_id INTEGER,
+               kind TEXT NOT NULL DEFAULT 'none',
+               evidence TEXT DEFAULT '',
+               source_url TEXT DEFAULT '',
+               obtained_at TIMESTAMP,
+               expires_at TIMESTAMP,
+               recorded_by TEXT DEFAULT '',
+               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
+        # The suppression list is append-only and permanent. Nothing in this
+        # codebase deletes from it.
+        f'''CREATE TABLE IF NOT EXISTS outreach_suppression (
+               id {pk},
+               destination TEXT NOT NULL,
+               channel TEXT DEFAULT 'all',
+               reason TEXT DEFAULT 'unsubscribe',
+               account_id INTEGER,
+               note TEXT DEFAULT '',
+               requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               honoured_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               recorded_by TEXT DEFAULT '')''',
+        # Every touch, every channel, sent or blocked. This is the audit trail
+        # a regulator would ask for, and the data that tells us which channel
+        # actually moves bottles.
+        f'''CREATE TABLE IF NOT EXISTS outreach_log (
+               id {pk},
+               account_id INTEGER,
+               destination TEXT DEFAULT '',
+               channel TEXT NOT NULL,
+               direction TEXT DEFAULT 'out',
+               rep TEXT DEFAULT '',
+               team TEXT DEFAULT '',
+               subject TEXT DEFAULT '',
+               body_summary TEXT DEFAULT '',
+               outcome TEXT DEFAULT '',
+               blocked_reason TEXT DEFAULT '',
+               bottles_moved INTEGER DEFAULT 0,
+               sku TEXT DEFAULT '',
+               consent_kind TEXT DEFAULT '',
+               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''',
+        'CREATE INDEX IF NOT EXISTS idx_supp_dest ON outreach_suppression(destination)',
+        'CREATE INDEX IF NOT EXISTS idx_cons_dest ON outreach_consent(destination)',
+        'CREATE INDEX IF NOT EXISTS idx_olog_created ON outreach_log(created_at)',
+        'CREATE INDEX IF NOT EXISTS idx_olog_account ON outreach_log(account_id)',
+    ]
+    cur = db.cursor()
+    for s in stmts:
+        try:
+            cur.execute(s)
+        except Exception:
+            db.rollback()
+    db.commit()
+    cur.close()
+    _OUTREACH_READY = True
+
+
+def _norm_dest(d):
+    return (d or '').strip().lower()
+
+
+def _is_suppressed(db, destination, channel='email'):
+    """Permanent block check. Matches an 'all'-channel suppression too."""
+    dest = _norm_dest(destination)
+    if not dest:
+        return False
+    ph = '%s' if USE_POSTGRES else '?'
+    rows = db_fetchall(
+        f"SELECT 1 FROM outreach_suppression WHERE LOWER(destination)={ph} "
+        f"AND (channel='all' OR channel={ph}) LIMIT 1", (dest, channel))
+    return bool(rows)
+
+
+def _consent_for(db, destination, channel='email'):
+    """Most recent consent record. Returns (kind, evidence) or ('none','')."""
+    dest = _norm_dest(destination)
+    if not dest:
+        return ('none', '')
+    ph = '%s' if USE_POSTGRES else '?'
+    rows = db_fetchall(
+        f"SELECT kind, COALESCE(evidence,''), expires_at FROM outreach_consent "
+        f"WHERE LOWER(destination)={ph} AND (channel='all' OR channel={ph}) "
+        f"ORDER BY COALESCE(obtained_at, created_at) DESC LIMIT 1",
+        (dest, channel))
+    if not rows:
+        return ('none', '')
+    kind, evidence, expires = rows[0]
+    if expires:
+        try:
+            exp = str(expires)[:10]
+            from datetime import date as _d
+            if _d.fromisoformat(exp) < _d.today():
+                return ('none', f'consent expired {exp}')
+        except (ValueError, TypeError):
+            pass
+    return (kind or 'none', evidence)
+
+
+def _sent_today(db, channel):
+    ph = '%s' if USE_POSTGRES else '?'
+    today = datetime.utcnow().date().isoformat()
+    rows = db_fetchall(
+        f"SELECT COUNT(*) FROM outreach_log WHERE channel={ph} "
+        f"AND direction='out' AND blocked_reason='' "
+        f"AND CAST(created_at AS TEXT) LIKE {ph}", (channel, today + '%'))
+    return int(rows[0][0]) if rows else 0
+
+
+def _outreach_gate(db, destination, channel, account_id=None):
+    """THE gate. Every send path calls this and honours the answer.
+
+    Returns (allowed: bool, reason: str, consent_kind: str). Order matters:
+    suppression is checked first and outranks every other signal, including
+    a later consent record. Someone who asked to be left alone stays left
+    alone unless a human re-records consent AND clears the suppression by
+    an explicit, logged act.
+    """
+    dest = _norm_dest(destination)
+    channel = (channel or 'email').lower()
+    if channel not in _OUTREACH_DAILY_CAP:
+        return (False, f'unknown channel {channel}', 'none')
+    # Calls and visits are outside CASL s.6 (s.6(8) excludes two-way voice),
+    # but a call is NOT unregulated: telemarketing sits under the CRTC
+    # Unsolicited Telecommunications Rules and the National DNCL. Treat the
+    # exemption as narrow, keep the cap and the log.
+    electronic = channel in _ELECTRONIC_CHANNELS
+    if electronic and not dest:
+        return (False, 'no destination', 'none')
+    if electronic and _is_suppressed(db, dest, channel):
+        return (False, 'SUPPRESSED: this contact asked not to be messaged',
+                'withdrawn')
+    kind, _ev = _consent_for(db, dest, channel) if electronic else ('n/a', '')
+    if electronic and kind in ('none', 'withdrawn'):
+        return (False, f'no recorded consent ({kind}); record consent with '
+                       f'evidence before sending', kind)
+    cap = _OUTREACH_DAILY_CAP[channel]
+    used = _sent_today(db, channel)
+    if used >= cap:
+        return (False, f'daily {channel} cap reached ({used}/{cap})', kind)
+    return (True, f'ok ({used + 1}/{cap} today)', kind)
+
+
+def _dnc_scrub(db, row):
+    """Fail-closed rendering. If a venue is suppressed, its email, phone and
+    handles are REMOVED from the payload and replaced with a DO NOT CONTACT
+    flag. A rep cannot message what the screen will not show, which is the
+    control that was missing when the unsubscribed venue kept getting mail.
+    """
+    if not isinstance(row, dict):
+        return row
+    candidates = [row.get('email'), row.get('phone'), row.get('destination'),
+                  row.get('contact_email')]
+    hit = any(_is_suppressed(db, c, 'email') or _is_suppressed(db, c, 'all')
+              for c in candidates if c)
+    if not hit:
+        return row
+    scrubbed = dict(row)
+    for k in ('email', 'phone', 'contact_email', 'destination', 'website',
+              'whatsapp', 'instagram'):
+        if k in scrubbed:
+            scrubbed[k] = ''
+    scrubbed['do_not_contact'] = True
+    scrubbed['dnc_note'] = ('This venue asked not to be contacted. Details '
+                            'hidden on purpose. Do not message them.')
+    return scrubbed
+
+
+@app.route('/api/outreach/suppression-check', methods=['POST'])
+def api_outreach_suppression_check():
+    """Bulk screen: hand it a list of destinations, get back which are
+    suppressed. Any list-building step must run through this before use."""
+    d = request.get_json(silent=True) or {}
+    dests = d.get('destinations') or []
+    if not isinstance(dests, list):
+        return jsonify({'error': 'destinations must be a list'}), 400
+    db = get_db()
+    _ensure_outreach(db)
+    blocked = [x for x in dests[:5000] if _is_suppressed(db, x, 'email')]
+    return jsonify({'checked': len(dests[:5000]), 'blocked': blocked,
+                    'safe_count': len(dests[:5000]) - len(blocked)})
+
+
+@app.route('/api/outreach/check', methods=['GET'])
+def api_outreach_check():
+    """Dry-run the gate. The UI calls this before showing a send button."""
+    dest = request.args.get('destination', '')
+    channel = request.args.get('channel', 'email')
+    db = get_db()
+    _ensure_outreach(db)
+    ok, reason, kind = _outreach_gate(db, dest, channel)
+    return jsonify({'destination': dest, 'channel': channel, 'allowed': ok,
+                    'reason': reason, 'consent_kind': kind,
+                    'daily_cap': _OUTREACH_DAILY_CAP.get(channel),
+                    'sent_today': _sent_today(db, channel)})
+
+
+@app.route('/api/outreach/suppress', methods=['POST'])
+@require_app_origin
+def api_outreach_suppress():
+    """Record an unsubscribe. Permanent, immediate, never deleted.
+    Accepts a bare email so anyone can be removed in one action."""
+    d = request.get_json(silent=True) or {}
+    dest = _norm_dest(d.get('destination'))
+    if not dest:
+        return jsonify({'error': 'destination required'}), 400
+    db = get_db()
+    _ensure_outreach(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    cur = db.cursor()
+    cur.execute(
+        f"INSERT INTO outreach_suppression (destination, channel, reason, "
+        f"account_id, note, recorded_by) VALUES ({ph},{ph},{ph},{ph},{ph},{ph})",
+        (dest, (d.get('channel') or 'all'), (d.get('reason') or 'unsubscribe'),
+         d.get('account_id'), (d.get('note') or ''), (d.get('rep') or '')))
+    db.commit()
+    cur.close()
+    return jsonify({'status': 'suppressed', 'destination': dest,
+                    'note': 'permanent across all channels unless a channel '
+                            'was specified; never auto-expires'})
+
+
+@app.route('/api/outreach/consent', methods=['POST'])
+@require_app_origin
+def api_outreach_consent():
+    """Record consent WITH evidence. Evidence is required: if we cannot say
+    where it came from, we cannot defend it, so we do not accept it."""
+    d = request.get_json(silent=True) or {}
+    dest = _norm_dest(d.get('destination'))
+    kind = (d.get('kind') or '').strip()
+    evidence = (d.get('evidence') or '').strip()
+    if not dest:
+        return jsonify({'error': 'destination required'}), 400
+    if kind not in _CONSENT_KINDS:
+        return jsonify({'error': f'kind must be one of {_CONSENT_KINDS}'}), 400
+    if kind != 'withdrawn' and len(evidence) < 8:
+        return jsonify({'error': 'evidence required: say where this consent '
+                                 'came from (e.g. "published on venue website '
+                                 'contact page, checked 2026-07-19")'}), 400
+    db = get_db()
+    _ensure_outreach(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    cur = db.cursor()
+    cur.execute(
+        f"INSERT INTO outreach_consent (destination, channel, account_id, "
+        f"kind, evidence, source_url, obtained_at, expires_at, recorded_by) "
+        f"VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph})",
+        (dest, (d.get('channel') or 'email'), d.get('account_id'), kind,
+         evidence, (d.get('source_url') or ''),
+         (d.get('obtained_at') or datetime.utcnow().isoformat()),
+         d.get('expires_at'), (d.get('rep') or '')))
+    if kind == 'withdrawn':
+        cur.execute(
+            f"INSERT INTO outreach_suppression (destination, channel, reason, "
+            f"account_id, recorded_by) VALUES ({ph},'all','withdrawn',{ph},{ph})",
+            (dest, d.get('account_id'), (d.get('rep') or '')))
+    db.commit()
+    cur.close()
+    return jsonify({'status': 'recorded', 'destination': dest, 'kind': kind})
+
+
+@app.route('/api/outreach/log', methods=['POST'])
+@require_app_origin
+def api_outreach_log():
+    """Log a touch. Electronic sends run the gate FIRST and are refused with
+    a 403 when blocked; the attempt is still logged so the block is auditable.
+    Visits and calls log freely: they are how bottles actually move."""
+    d = request.get_json(silent=True) or {}
+    channel = (d.get('channel') or '').lower()
+    dest = _norm_dest(d.get('destination'))
+    db = get_db()
+    _ensure_outreach(db)
+    ok, reason, kind = _outreach_gate(db, dest, channel, d.get('account_id'))
+    ph = '%s' if USE_POSTGRES else '?'
+    cur = db.cursor()
+    cur.execute(
+        f"INSERT INTO outreach_log (account_id, destination, channel, "
+        f"direction, rep, team, subject, body_summary, outcome, "
+        f"blocked_reason, bottles_moved, sku, consent_kind) VALUES "
+        f"({ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph},{ph})",
+        (d.get('account_id'), dest, channel, (d.get('direction') or 'out'),
+         (d.get('rep') or ''), (d.get('team') or ''), (d.get('subject') or ''),
+         (d.get('body_summary') or ''), (d.get('outcome') or ''),
+         '' if ok else reason, int(d.get('bottles_moved') or 0),
+         (d.get('sku') or ''), kind))
+    db.commit()
+    cur.close()
+    if not ok:
+        return jsonify({'status': 'BLOCKED', 'reason': reason,
+                        'logged': True}), 403
+    return jsonify({'status': 'logged', 'consent_kind': kind, 'note': reason})
+
+
+@app.route('/api/outreach/scoreboard', methods=['GET'])
+def api_outreach_scoreboard():
+    """Which channel actually moves bottles. Built to kill dead channels:
+    the last email blast is the reason this number exists."""
+    days = max(7, min(request.args.get('days', default=90, type=int), 365))
+    db = get_db()
+    _ensure_outreach(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    since = (datetime.utcnow().date() - timedelta(days=days)).isoformat()
+    rows = db_fetchall(
+        f"SELECT channel, COUNT(*), "
+        f"SUM(CASE WHEN blocked_reason='' THEN 1 ELSE 0 END), "
+        f"COALESCE(SUM(bottles_moved),0) FROM outreach_log "
+        f"WHERE direction='out' AND CAST(created_at AS TEXT) >= {ph} "
+        f"GROUP BY channel", (since,))
+    out = []
+    for ch, total, sent, bottles in rows:
+        sent = int(sent or 0)
+        out.append({'channel': ch, 'attempts': int(total or 0), 'sent': sent,
+                    'blocked': int(total or 0) - sent,
+                    'bottles_moved': int(bottles or 0),
+                    'bottles_per_touch': round((bottles or 0) / sent, 2)
+                    if sent else 0.0})
+    out.sort(key=lambda r: -r['bottles_moved'])
+    supp = db_fetchall("SELECT COUNT(*) FROM outreach_suppression")
+    return jsonify({'days': days, 'rows': out,
+                    'suppression_list_size': int(supp[0][0]) if supp else 0,
+                    'caps': _OUTREACH_DAILY_CAP,
+                    'note': 'bottles_per_touch is the only number that '
+                            'decides whether a channel survives'})
+
+
+# ─── TEAM QUEUES: SALES / MARKETING / OUTREACH ──────────────────────────────
+# Three roles, one dataset, one scoreboard. Ranking is deliberately biased to
+# the channels that actually move bottles: a walk-in beats a call, a call
+# beats an email, and email only appears where consent already exists.
+
+_TEAM_ROLES = ('sales', 'marketing', 'outreach')
+
+# Warehouse/depot store numbers: reserve stock, not a shelf anyone can taste
+# at. Module-level so every queue and the autopilot share one definition.
+_DEPOTS = {940, 947, 950, 974}
+
+
+def _team_sales_queue(db, limit=25):
+    """SALES: doors that are already open. Reorder-due customers first, then
+    warm accounts near stock that is sitting."""
+    ph = '%s' if USE_POSTGRES else '?'
+    rows = []
+    for hid, name, city, addr, phone, prods, last in db_fetchall(
+            f"SELECT h.id, h.name, COALESCE(h.city,''), COALESCE(h.address,''), "
+            f"COALESCE(h.phone,''), COALESCE(h.products_carried,''), "
+            f"MAX(CAST(d.created_at AS TEXT)) FROM horeca_accounts h "
+            f"JOIN deals d ON d.horeca_account_id = h.id "
+            f"WHERE h.status='customer' AND d.stage='ordered' "
+            f"GROUP BY h.id, h.name, h.city, h.address, h.phone, "
+            f"h.products_carried ORDER BY MAX(CAST(d.created_at AS TEXT)) ASC "
+            f"LIMIT {int(limit)}", ()):
+        days = 999
+        if last:
+            try:
+                from datetime import date as _d
+                days = (_d.today() - _d.fromisoformat(str(last)[:10])).days
+            except (ValueError, TypeError):
+                pass
+        if days < 14:
+            continue
+        rows.append({
+            'account_id': hid, 'name': name, 'city': city, 'address': addr,
+            'phone': phone, 'carries': prods, 'days_quiet': days,
+            'action': 'call' if phone else 'visit',
+            'why': f'bought before, quiet {days} days',
+            'priority': min(95, 60 + days // 3)})
+    rows.sort(key=lambda r: -r['priority'])
+    return rows[:limit]
+
+
+def _team_outreach_queue(db, limit=25):
+    """OUTREACH: doors not yet open. Licensed venues with a phone come FIRST
+    because a call is unregulated, effective, and cannot be a CASL breach.
+    Email only appears for contacts that already have recorded consent."""
+    _ensure_outreach(db)
+    # agco_licensees.phone is added by the sweep migration, not the base
+    # table, so this queue must ensure it before selecting on it.
+    _ensure_gtha_sweep(db)
+    ph = '%s' if USE_POSTGRES else '?'
+    rows = []
+    for lic, name, city, addr, phone in db_fetchall(
+            f"SELECT licence_number, name, COALESCE(city,''), "
+            f"COALESCE(address,''), COALESCE(phone,'') FROM agco_licensees "
+            f"WHERE status IN ('Active','Deemed to Continue') "
+            f"AND matched_account_id IS NULL AND COALESCE(phone,'') != '' "
+            f"LIMIT {int(limit) * 3}", ()):
+        rows.append({
+            'licence_number': lic, 'name': name, 'city': city,
+            'address': addr, 'phone': phone, 'action': 'call',
+            'why': 'licensed venue, never contacted, phone on file',
+            'priority': 70,
+            'casl_note': 'calls sit outside CASL s.6 but under the CRTC '
+                         'telemarketing rules and the National DNCL: '
+                         'business-to-business calling is the narrow lane '
+                         'we work in [verify with counsel]'})
+        if len(rows) >= limit:
+            break
+    return [_dnc_scrub(db, r) for r in rows]
+
+
+def _team_marketing_queue(db, limit=25):
+    """MARKETING: the pull side. Stores holding deep stock earn a tasting,
+    and venues that already carry us earn content and a menu feature."""
+    rows = []
+    for sn, acct, addr, city, tot in db_fetchall(
+            "SELECT s.store_number, COALESCE(s.account,''), "
+            "COALESCE(s.address,''), COALESCE(s.city,''), SUM(i.on_hand) "
+            "FROM sod_inventory i JOIN stores s ON s.store_number = i.store_number "
+            "WHERE i.snapshot_date = (SELECT MAX(snapshot_date) FROM sod_inventory) "
+            "GROUP BY s.store_number, s.account, s.address, s.city "
+            "HAVING SUM(i.on_hand) >= 24 ORDER BY SUM(i.on_hand) DESC "
+            f"LIMIT {int(limit)}", ()):
+        if sn in _DEPOTS:
+            continue
+        rows.append({'store_number': sn, 'store_label': _store_label(db, sn),
+                     'on_hand': int(tot or 0), 'action': 'book staff tasting',
+                     'why': f'{int(tot or 0)} bottles sitting on this shelf',
+                     'priority': 75})
+    return rows[:limit]
+
+
+@app.route('/api/team/queue', methods=['GET'])
+def api_team_queue():
+    """One role's work for today. ?role=sales|marketing|outreach"""
+    role = (request.args.get('role') or 'sales').lower()
+    if role not in _TEAM_ROLES:
+        return jsonify({'error': f'role must be one of {_TEAM_ROLES}'}), 400
+    limit = max(5, min(request.args.get('limit', default=25, type=int), 100))
+    db = get_db()
+    _ensure_horeca_v2(db)
+    fn = {'sales': _team_sales_queue, 'marketing': _team_marketing_queue,
+          'outreach': _team_outreach_queue}[role]
+    rows = fn(db, limit)
+    return jsonify({'role': role, 'count': len(rows), 'rows': rows,
+                    'caps': _OUTREACH_DAILY_CAP,
+                    'rule': 'visits and calls rank above email everywhere: '
+                            'they move more bottles and carry no CASL risk'})
+
+
 # ─── CLEARANCE AUTOPILOT ────────────────────────────────────────────────────
 # The sales-manager function, automated: every morning the system reads stock,
 # velocity, the pipeline and the target boards, DECIDES the work, and hands
@@ -10168,7 +10652,6 @@ def _generate_daily_actions(conn, rep=None):
         "GROUP BY i.store_number, s.account, s.address, s.city "
         "HAVING SUM(i.on_hand) >= 24 "
         "ORDER BY tot DESC LIMIT 12")
-    _DEPOTS = {940, 947, 950, 974}
     for sn, acct, addr, city, tot, nskus in cur.fetchall():
         if sn in _DEPOTS:
             continue  # warehouse/depot — reserve stock, not a tasteable shelf
