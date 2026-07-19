@@ -3,9 +3,9 @@
   "short_name": "Anu Imports",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#0f1117",
-  "theme_color": "#6c5ce7",
-  "description": "Anu Imports portfolio tracker — HORECA prospecting, LCBO store visits, tastings and listings",
+  "background_color": "#060c18",
+  "theme_color": "#060c18",
+  "description": "Anu Imports portfolio tracker: HORECA prospecting, LCBO store visits, tastings and listings",
   "icons": [
     {
       "src": "/static/icon-192.png",
