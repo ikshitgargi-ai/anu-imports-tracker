@@ -1720,19 +1720,37 @@ def api_stores():
     query = "SELECT * FROM stores WHERE 1=1"
     params = []
     if search:
-        query += " AND (CAST(store_number AS TEXT) LIKE ? OR account LIKE ? OR address LIKE ? OR city LIKE ? OR manager_name LIKE ?)"
+        # LOWER() on both sides: Postgres LIKE is case-SENSITIVE while
+        # SQLite's is not, so a bare LIKE means store search silently fails
+        # in production for anything not typed in exact case.
+        query += (" AND (CAST(store_number AS TEXT) LIKE ?"
+                  " OR LOWER(account) LIKE ? OR LOWER(address) LIKE ?"
+                  " OR LOWER(city) LIKE ? OR LOWER(manager_name) LIKE ?)")
         s = f"%{search}%"
-        params.extend([s, s, s, s, s])
+        sl = f"%{search.lower()}%"
+        params.extend([s, sl, sl, sl, sl])
     if city:
-        query += " AND city LIKE ?"
-        params.append(f"%{city}%")
+        query += " AND LOWER(city) LIKE ?"
+        params.append(f"%{city.lower()}%")
     if producer:
-        query += " AND producer LIKE ?"
-        params.append(f"%{producer}%")
+        query += " AND LOWER(producer) LIKE ?"
+        params.append(f"%{producer.lower()}%")
 
     count_query = query.replace("SELECT *", "SELECT COUNT(*)", 1)
     total = db_fetchone(count_query, params)
-    total = total[0] if isinstance(total, tuple) else (total.get('count', 0) if isinstance(total, dict) else list(total.values())[0])
+    # sqlite3.Row supports indexing but has no .values(), so the old
+    # dict-then-values fallback raised AttributeError and 500'd this endpoint
+    # on every SQLite run. Index-first works for tuple, Row and psycopg2 rows
+    # alike; the dict branch stays for RealDictCursor.
+    if total is None:
+        total = 0
+    elif isinstance(total, dict):
+        total = total.get('count', 0)
+    else:
+        try:
+            total = total[0]
+        except (TypeError, KeyError, IndexError):
+            total = 0
 
     query += " ORDER BY store_number ASC LIMIT ? OFFSET ?"
     params.extend([per_page, (page - 1) * per_page])
@@ -9985,7 +10003,10 @@ def _velocity_payload(days, sku_f):
     db = get_db()
     ph = '%s' if USE_POSTGRES else '?'
     from datetime import date as _date, timedelta as _td
-    since = (_date.today() - _td(days=days)).isoformat()
+    # Toronto business date, not UTC: Render runs UTC and the SOD feed
+    # carries the LCBO's own business date, so _date.today() drops or
+    # double-counts a day's snapshots around midnight.
+    since = (_toronto_today() - _td(days=days)).isoformat()
     where = f"snapshot_date >= {ph}"
     params = [since]
     if sku_f:
@@ -11654,6 +11675,26 @@ _EXPORT_TABLES = [
     # fold, exported alongside so a restore is instant.
     ('listing_ledger',             'id'),
     ('store_listings',             'id'),
+    # Outreach engine. outreach_suppression is the permanent do-not-contact
+    # list: losing it would let us email people who explicitly asked us to
+    # stop, so it MUST be in every backup. outreach_log is the audit trail a
+    # regulator would ask for. commission_credits is money owed to reps.
+    ('outreach_consent',           'id'),
+    ('outreach_suppression',       'id'),
+    ('outreach_log',               'id'),
+    ('commission_programs',        'id'),
+    ('commission_credits',         'id'),
+    ('target_list_entries',        'id'),
+    ('action_queue',               'id'),
+    # Permanent coverage + watchdog
+    ('store_coverage',             'id'),
+    ('system_heartbeat',           'id'),
+    # Reports + evidence
+    ('report_snapshots',           'id'),
+    ('weekly_reports',             'id'),
+    ('visit_photos',               'id'),
+    # Deliberately NOT exported: inventory_cache and daily_plan_cache are
+    # pure derived caches, rebuilt on demand. Everything else belongs here.
     # Optional (large)
     ('sod_inventory',              None),  # 1M+ rows, only included with ?include=all
     ('inventory_history',          None),
@@ -11672,6 +11713,11 @@ _RETENTION_PROTECTED_TABLES = frozenset((
     'sod_inventory', 'lcbo_live_snapshots', 'activities',
     'listing_ledger', 'store_listings', 'agco_licensees',
     'horeca_accounts', 'deals', 'horeca_activities',
+    # Append-only and irreplaceable: a do-not-contact request, the money a rep
+    # has earned, the regulator audit trail, and the permanent store record.
+    # A replace-mode restore must never truncate any of these.
+    'outreach_suppression', 'outreach_consent', 'outreach_log',
+    'commission_credits', 'store_coverage',
 ))
 
 
@@ -16497,6 +16543,10 @@ def _build_essential_backup():
         'schema_version': 1,
         'include': 'core',
         'tables': {},
+        # Any table that failed to export lands here. A backup with a
+        # non-empty errors list is NOT a successful backup, no matter how
+        # cleanly the email sent.
+        'errors': [],
     }
     excluded = {'sod_inventory', 'inventory_history'}
     for tname, _pk in _EXPORT_TABLES:
@@ -16522,6 +16572,14 @@ def _build_essential_backup():
                 except Exception:
                     pass
             out['tables'][tname] = {'error': str(e)}
+            out['errors'].append(f'{tname}: {e}')
+    # Crown jewels: if any of these is missing or errored, the backup is a
+    # failure even if every other table came through.
+    for critical in ('listing_ledger', 'store_listings', 'activities',
+                     'outreach_suppression', 'commission_credits'):
+        t = out['tables'].get(critical)
+        if t is None or 'error' in t:
+            out['errors'].append(f'CRITICAL TABLE MISSING: {critical}')
     return out
 
 
@@ -16607,15 +16665,29 @@ def start_backup_scheduler():
         def _run_backup():
             try:
                 payload = _build_essential_backup()
+                errs = payload.get('errors') or []
                 ok = _send_backup_email(payload)
+                # A partial backup is a FAILED backup. Reporting it green is
+                # how a real data loss goes unnoticed for weeks.
+                healthy = bool(ok) and not errs
                 try:
                     _bc = _sod_get_conn()
                     _ensure_spine(_bc)
-                    _heartbeat(_bc, 'backup', bool(ok),
-                               'emailed' if ok else 'send failed')
+                    _heartbeat(_bc, 'backup', healthy,
+                               'emailed' if healthy else
+                               f'PARTIAL/FAILED: {"; ".join(errs)[:300]}'
+                               if errs else 'send failed')
                     _bc.close()
                 except Exception:
                     pass
+                if errs:
+                    send_alert(
+                        subject=f"Daily backup INCOMPLETE — {len(errs)} table(s) missing",
+                        body="These tables did not make it into today's backup:\n\n"
+                             + "\n".join(errs) +
+                             "\n\nTreat today's archive as unusable for restore.",
+                        level='critical',
+                    )
                 if not ok:
                     send_alert(
                         subject="Daily backup failed to send",

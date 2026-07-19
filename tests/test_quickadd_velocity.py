@@ -317,3 +317,35 @@ class TestRebalance:
 
     def test_unknown_sku_rejected(self, seeded, client):
         assert client.get('/api/sales/rebalance?sku=9999999').status_code == 400
+
+
+class TestAuditRegressions:
+    """Regressions for defects a 32-agent audit confirmed in production code."""
+
+    def test_store_search_is_case_insensitive(self, seeded, client,
+                                              app_module):
+        # Postgres LIKE is case-sensitive; SQLite's is not. A bare LIKE meant
+        # store search silently returned nothing on prod for wrong-case input.
+        app_module._rate_buckets.clear()
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            db.execute("INSERT OR IGNORE INTO stores (store_number, account, "
+                       "city) VALUES (9001,'Airport & Bovaird','Brampton')")
+            db.commit()
+        counts = {}
+        for term in ('brampton', 'BRAMPTON', 'BrAmPtOn', 'Brampton'):
+            r = client.get(f'/api/stores?search={term}')
+            assert r.status_code == 200, r.get_json()
+            counts[term] = r.get_json()['total']
+        assert counts['brampton'] > 0, 'lowercase search found nothing'
+        assert len(set(counts.values())) == 1, (
+            f'case changed the result set, so LIKE is case-sensitive: {counts}')
+
+    def test_velocity_uses_toronto_business_date(self, app_module):
+        # Render runs UTC; the SOD feed carries the LCBO business date. Using
+        # _date.today() drops or double-counts a day's snapshots at midnight.
+        import inspect
+        src = inspect.getsource(app_module._velocity_payload)
+        assert '_toronto_today()' in src
+        # the only remaining mention is the comment explaining WHY not to
+        assert 'since = (_toronto_today()' in src

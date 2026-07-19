@@ -168,3 +168,63 @@ class TestHeartbeat:
         t.start()
         t.join()
         assert not errors, f'heartbeat failed in a bare thread: {errors}'
+
+
+class TestBackupCoverageCannotDrift:
+    """The audit found 14 tables silently absent from the backup, including
+    the do-not-contact list and the reps' commission credits. The old test
+    checked an allowlist, so it could only catch REMOVALS, never a new table
+    that nobody added. This one enumerates the real schema instead."""
+
+    ALLOWED_UNBACKED = {
+        # pure derived caches, rebuilt on demand
+        'inventory_cache', 'daily_plan_cache',
+        # sqlite/pg internals
+        'sqlite_sequence',
+    }
+
+    def test_every_table_is_either_backed_up_or_explicitly_excused(
+            self, seeded, app_module):
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            app_module._ensure_spine(db)
+            app_module._ensure_outreach(db)
+            app_module._ensure_sales_cmd(db)
+            app_module._ensure_horeca_v2(db)
+            app_module._ensure_listing_ledger(db)
+            live = {r[0] for r in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        exported = {t for t, _pk in app_module._EXPORT_TABLES}
+        missing = live - exported - self.ALLOWED_UNBACKED
+        assert not missing, (
+            'these tables exist but are backed up NOWHERE: '
+            + ', '.join(sorted(missing)))
+
+    def test_irreplaceable_tables_survive_a_replace_restore(self, app_module):
+        prot = app_module._RETENTION_PROTECTED_TABLES
+        for t in ('outreach_suppression', 'outreach_consent', 'outreach_log',
+                  'commission_credits', 'store_coverage', 'listing_ledger'):
+            assert t in prot, f'{t} could be truncated by a replace restore'
+
+    def test_partial_backup_is_reported_as_a_failure(self, seeded, app_module):
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            app_module._ensure_spine(db)
+            app_module._ensure_outreach(db)
+            app_module._ensure_sales_cmd(db)
+            app_module._ensure_listing_ledger(db)
+            payload = app_module._build_essential_backup()
+        assert 'errors' in payload, 'backup has no failure channel'
+        # every crown-jewel table must be present and error-free
+        for critical in ('listing_ledger', 'activities',
+                         'outreach_suppression', 'commission_credits'):
+            t = payload['tables'].get(critical)
+            assert t is not None, f'{critical} absent from backup payload'
+            assert 'error' not in t, f'{critical} failed to export'
+        # The channel must actually capture failures rather than swallow
+        # them: any table that could not be read has to appear here, and a
+        # crown-jewel failure must be called out by name.
+        for e in payload['errors']:
+            assert ':' in e or 'CRITICAL' in e
+        assert not [e for e in payload['errors'] if 'CRITICAL' in e], \
+            f'a crown-jewel table failed to back up: {payload["errors"]}'
