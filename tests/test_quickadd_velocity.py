@@ -219,6 +219,29 @@ class TestQuickAdd:
         assert len(r.get_json()['candidates']) == 2
 
 
+class TestGoogleCompliance:
+    def test_google_rows_carry_attribution_and_display_only_note(
+            self, seeded, client, app_module):
+        # Google forbids storing their place content and requires attribution
+        # when their data is shown without a Google map. Both must ride along
+        # on every google row so no future UI can drop them silently.
+        orig = app_module._photon_suggest
+        app_module._google_autocomplete = lambda q, limit=5: [
+            {'kind': 'google', 'name': 'Somewhere New', 'address': 'X St',
+             'city': 'Toronto', 'attribution': 'Powered by Google',
+             'note': 'live Google suggestion, display only: '
+                     'Google content is never written to the DB'}]
+        try:
+            rows = client.get(
+                '/api/horeca/venue-search?q=somewhere&live=1').get_json()['rows']
+            g = [r for r in rows if r['kind'] == 'google']
+            assert g and g[0]['attribution'] == 'Powered by Google'
+            assert 'never written to the DB' in g[0]['note']
+        finally:
+            app_module._google_autocomplete = lambda q, limit=5: []
+            app_module._photon_suggest = orig
+
+
 class TestGoogleParse:
     def test_city_never_becomes_province(self, app_module):
         parts_in = 'Toronto, ON, Canada'

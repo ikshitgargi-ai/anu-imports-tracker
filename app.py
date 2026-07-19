@@ -9796,7 +9796,9 @@ def _google_autocomplete(q, limit=5):
                 city = parts[0]
                 addr = ''
             out.append({'kind': 'google', 'name': name, 'address': addr,
-                        'city': city, 'note': 'live Google suggestion'})
+                        'city': city, 'attribution': 'Powered by Google',
+                        'note': ('live Google suggestion, display only: '
+                                 'Google content is never written to the DB')})
         return out
     except Exception:
         return []
