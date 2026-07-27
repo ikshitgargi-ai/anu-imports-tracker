@@ -5264,12 +5264,24 @@ def _sod_last_successful_sync_age_hours():
     return (datetime.utcnow() - val).total_seconds() / 3600.0
 
 
-def _max_snapshot_date():
+_SNAP_DATE_CACHE = {'val': None, 'at': 0.0}
+_SNAP_DATE_TTL = 1800  # 30 min: healthz pings must not wake the database
+
+
+def _max_snapshot_date(force=False):
     """Get MAX(snapshot_date) from sod_inventory using a dedicated connection.
 
-    Safe to call outside Flask request context (e.g. from startup/scheduler).
-    Returns a date or None.
+    Cached for 30 minutes: Render/uptime monitors ping /healthz constantly,
+    and each uncached call woke the Neon compute. That standing wake is what
+    exhausted the free compute quota and took BOTH trackers dark on
+    2026-07-26. Freshness display can be half an hour stale; the database
+    being allowed to sleep cannot be optional. force=True bypasses (used by
+    ingest itself right after a write).
     """
+    now_ts = time.time()
+    if not force and _SNAP_DATE_CACHE['val'] is not None and \
+            (now_ts - _SNAP_DATE_CACHE['at']) < _SNAP_DATE_TTL:
+        return _SNAP_DATE_CACHE['val']
     try:
         conn = _sod_get_conn()
         cur = conn.cursor()
@@ -5277,21 +5289,27 @@ def _max_snapshot_date():
         r = cur.fetchone()
         cur.close()
         conn.close()
-        if not r:
-            return None
-        snap = r[0]
-        if snap is None:
-            return None
-        if isinstance(snap, str):
-            try:
-                return datetime.strptime(snap, '%Y-%m-%d').date()
-            except Exception:
-                return None
-        if hasattr(snap, 'date'):
-            return snap.date()
-        return snap
+        snap = r[0] if r else None
+        val = None
+        if snap is not None:
+            if isinstance(snap, str):
+                try:
+                    val = datetime.strptime(snap, '%Y-%m-%d').date()
+                except Exception:
+                    val = None
+            elif hasattr(snap, 'date'):
+                val = snap.date()
+            else:
+                val = snap
+        _SNAP_DATE_CACHE['val'] = val
+        _SNAP_DATE_CACHE['at'] = time.time()
+        return val
     except Exception:
-        return None
+        # Do NOT cache failure as None-with-fresh-timestamp forever, but DO
+        # hold it briefly so a dead database is not hammered by every ping.
+        _SNAP_DATE_CACHE['val'] = _SNAP_DATE_CACHE['val'] or None
+        _SNAP_DATE_CACHE['at'] = time.time()
+        return _SNAP_DATE_CACHE['val']
 
 
 def _sod_data_age_days():
@@ -28310,9 +28328,25 @@ def start_sweep_scheduler():
             sched = BackgroundScheduler(timezone='America/Toronto')
         except Exception:
             sched = BackgroundScheduler()
+        # The GTHA sweep finished at 435/435 tiles long ago. Scheduling the
+        # drainer anyway meant a database wake every 3 minutes forever, for
+        # nothing. Check once at boot; skip entirely when there is no work.
+        try:
+            _c = _sod_get_conn()
+            _cur = _c.cursor()
+            _cur.execute("SELECT COUNT(*) FROM osm_sweep_tiles "
+                         "WHERE status IN ('pending','error')")
+            _pending = int(_cur.fetchone()[0] or 0)
+            _cur.close()
+            _c.close()
+        except Exception:
+            _pending = 1   # unknown: schedule, the drainer self-noops
+        if _pending == 0:
+            print('[SWEEP] complete — drainer NOT scheduled (no DB wakes)')
+            return
         sched.add_job(
             lambda: _sweep_drain_standalone(6),
-            IntervalTrigger(minutes=3),
+            IntervalTrigger(minutes=30),
             id='gtha_sweep_drain',
             replace_existing=True,
             max_instances=1,
@@ -28321,7 +28355,7 @@ def start_sweep_scheduler():
         )
         sched.start()
         _sweep_scheduler = sched
-        print('[SWEEP] drainer scheduled — 6 tiles every 3 min until complete')
+        print('[SWEEP] drainer scheduled — 6 tiles every 30 min until complete')
     except Exception as e:
         print(f'[SWEEP] scheduler failed to start: {e}')
 
@@ -28395,7 +28429,7 @@ def start_sales_scheduler():
                       max_instances=1, coalesce=True, misfire_grace_time=3600)
         # Drain pins onto pipeline accounts so the day router always has
         # something to route (free licence copy + throttled geocode).
-        sched.add_job(_geocode_pipeline_daily, IntervalTrigger(minutes=4),
+        sched.add_job(_geocode_pipeline_daily, IntervalTrigger(minutes=60),
                       id='sales_geocode_pins', replace_existing=True,
                       max_instances=1, coalesce=True, misfire_grace_time=600)
         # Clearance autopilot: refill the rep action queue every morning.
@@ -28404,7 +28438,7 @@ def start_sales_scheduler():
                       max_instances=1, coalesce=True, misfire_grace_time=3600)
         sched.start()
         _sales_scheduler = sched
-        print('[SALES] auto-hunt daily 06:30 ET + pin-geocoder every 4 min')
+        print('[SALES] auto-hunt daily 06:30 ET + pin-geocoder hourly')
     except Exception as e:
         print(f'[SALES] scheduler failed to start: {e}')
 
