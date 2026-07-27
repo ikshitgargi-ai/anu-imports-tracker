@@ -4590,14 +4590,27 @@ def _sod_sync_worker(sources):
             for s in sources:
                 _sod_last_result[s] = {'status': 'failed', 'error': str(e), 'source': s}
             return
+        any_ok = False
         for src in sources:
             result = run_sod_sync(src, client=client)
             _sod_last_result[src] = result
+            if result.get('status') == 'success':
+                any_ok = True
             print(f'[SOD] {src}: {result.get("status")} '
                   f'rows={result.get("total_rows",0)} '
                   f'anu={result.get("anu_rows",0)} '
                   f'new_listings={result.get("new_listings",0)} '
                   f'new_delistings={result.get("new_delistings",0)}')
+        # Report in so the watchdog sees ingest alive; silence is the alarm.
+        try:
+            _hb = _sod_get_conn()
+            _ensure_spine(_hb)
+            _heartbeat(_hb, 'sod_ingest', any_ok,
+                       ', '.join(f"{s}:{(_sod_last_result.get(s) or {}).get('status')}"
+                                 for s in sources))
+            _hb.close()
+        except Exception as _e:
+            print(f'[SOD] heartbeat skipped: {_e}')
     finally:
         _sod_sync_lock.release()
 
@@ -5855,6 +5868,15 @@ def start_health_scheduler():
                     )
                 except Exception:
                     pass
+            finally:
+                # Watchdog check-in: the probe itself must be provably alive.
+                try:
+                    _hb = _sod_get_conn()
+                    _ensure_spine(_hb)
+                    _heartbeat(_hb, 'health_check', True, 'daily probe ran')
+                    _hb.close()
+                except Exception as _e:
+                    print(f'[health] heartbeat skipped: {_e}')
         sched.add_job(
             _in_app_context(_run),
             CronTrigger(hour=6, minute=0),  # 06:00 ET — after SOD sync at 03:00
@@ -25618,8 +25640,18 @@ def start_lcbo_scheduler():
         # Every 30 minutes from 06:00 to 23:00 ET (35 runs/day) — near-realtime.
         # User asked for "by-the-second" — this is the closest we can get without
         # rate-limiting LCBO.com. Each run reconciles tracked SKUs against SOD.
+        def _scrape_with_heartbeat():
+            _lcbo_daily_scrape_worker()
+            try:
+                _hb = _sod_get_conn()
+                _ensure_spine(_hb)
+                _heartbeat(_hb, 'live_scrape', True, '30-min cycle done')
+                _hb.close()
+            except Exception as _e:
+                print(f'[LCBO-live] heartbeat skipped: {_e}')
+
         sched.add_job(
-            _lcbo_daily_scrape_worker,
+            _scrape_with_heartbeat,
             CronTrigger(hour='6-23', minute='0,30'),
             id='lcbo_30min_scrape',
             replace_existing=True,
