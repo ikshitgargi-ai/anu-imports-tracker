@@ -5312,13 +5312,14 @@ def _max_snapshot_date(force=False):
         return _SNAP_DATE_CACHE['val']
 
 
-def _sod_data_age_days():
+def _sod_data_age_days(force=False):
     """Return days between today (Toronto) and the freshest snapshot in sod_inventory.
 
     This is the TRUE freshness — what the user actually cares about.
-    Returns None if no data ingested yet.
+    Returns None if no data ingested yet. force=True bypasses the 30-min
+    cache (strict monitors need truth; uptime pings do not).
     """
-    snap = _max_snapshot_date()
+    snap = _max_snapshot_date(force=force)
     if snap is None:
         return None
     try:
@@ -5357,7 +5358,7 @@ def _last_successful_run_age_hours_safe():
         return None
 
 
-def _sod_freshness():
+def _sod_freshness(force=False):
     """Return a freshness summary dict used by every report response.
 
     Keys:
@@ -5366,7 +5367,7 @@ def _sod_freshness():
       is_stale: bool (True if age > 1 day — emails an alert at the next health check)
       last_run_age_hours: float or None
     """
-    snap = _max_snapshot_date()
+    snap = _max_snapshot_date(force=force)
     age_days = None
     if snap is not None:
         try:
@@ -5572,7 +5573,7 @@ def api_sod_health():
       503 + status='stale' if snapshot is > 1 day old.
       503 + status='never_synced' if no data ingested yet.
     """
-    fresh_info = _sod_freshness()
+    fresh_info = _sod_freshness(force=True)
     age_days = fresh_info['snapshot_age_days']
     age_hours = _sod_last_successful_sync_age_hours()
     if age_days is None:
@@ -5606,7 +5607,7 @@ def api_healthz():
     cron) but NOT from public uptime services like UptimeRobot.
     """
     deep = request.args.get('deep') in ('1', 'true', 'yes')
-    fresh = _sod_freshness()
+    fresh = _sod_freshness(force=deep)
     age_days = fresh.get('snapshot_age_days')
     # Strict (deep) freshness threshold relaxed to 2 days — accounts for
     # weekends where LCBO may not publish a fresh file Sat/Sun. The hourly

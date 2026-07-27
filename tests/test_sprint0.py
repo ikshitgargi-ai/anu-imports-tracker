@@ -306,10 +306,13 @@ class TestFreshnessFromSnapshotDate:
         conn.commit()
         conn.close()
 
-        age = m._sod_data_age_days()
+        # force=True: this test asserts the freshness MATH. The 30-min cache
+        # in front of it exists so healthz pings cannot wake the database
+        # (the 2026-07-26 Neon quota outage); strict monitors bypass it.
+        age = m._sod_data_age_days(force=True)
         assert age == 5, f"BUG: data age should be 5 days, got {age}"
 
-        fresh = m._sod_freshness()
+        fresh = m._sod_freshness(force=True)
         assert fresh['snapshot_age_days'] == 5
         assert fresh['is_stale'] is True, "BUG: is_stale should be True when age > 2 days"
 
@@ -328,6 +331,9 @@ class TestFreshnessFromSnapshotDate:
         when SOD is stale (uptime monitors must stay green over weekends) —
         the strict check moved behind ?deep=1. Test updated to match.
         """
+        # plain /healthz serves the cached value (cheap for uptime pings);
+        # reset the cache so this test sees current data through it.
+        app_module._SNAP_DATE_CACHE['at'] = 0.0
         r = client.get('/healthz')
         assert r.status_code == 200, 'liveness probe must stay 200 when stale'
         assert r.json['snapshot_age_days'] == 5
