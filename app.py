@@ -16612,8 +16612,16 @@ def _build_essential_backup():
                     db.rollback()
                 except Exception:
                     pass
-            out['tables'][tname] = {'error': str(e)}
-            out['errors'].append(f'{tname}: {e}')
+            emsg = str(e)
+            missing = ('does not exist' in emsg) or ('no such table' in emsg)
+            out['tables'][tname] = {'error': emsg}
+            # A table that simply has not been created yet (lazy DDL, empty
+            # feature) is recorded but is not a failed backup; a crown jewel
+            # missing is still caught by the explicit check below.
+            if missing:
+                out.setdefault('skipped_missing', []).append(tname)
+            else:
+                out['errors'].append(f'{tname}: {emsg}')
     # Crown jewels: if any of these is missing or errored, the backup is a
     # failure even if every other table came through.
     for critical in ('listing_ledger', 'store_listings', 'activities',
