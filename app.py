@@ -11107,7 +11107,7 @@ def _autopilot_daily():
                 pass
 
 
-_OFFICIAL_STORE_REPS = ('ikshit', 'vaneet', 'ed', 'namit')
+_OFFICIAL_STORE_REPS = ('ikshit', 'vaneet', 'ed', 'namit', 'surya')
 
 
 @app.route('/api/admin/clean-store-reps', methods=['POST'])
