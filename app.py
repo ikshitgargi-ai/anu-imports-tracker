@@ -4770,6 +4770,58 @@ def api_sod_coverage():
             pass
 
 
+@app.route('/api/sod/history', methods=['GET'])
+def api_sod_history():
+    """Day-by-day history for the tracked SKUs, any range up to a full year.
+
+    Query: from=YYYY-MM-DD, to=YYYY-MM-DD, or ytd=1 for Jan 1 to today.
+    Defaults to the last 365 days.
+
+    Every day in the window is returned, including days we do not hold
+    (present=false), so a hole shows up in the series instead of the chart
+    quietly closing over it.
+    """
+    today = _sod_toronto_today()
+    if request.args.get('ytd') in ('1', 'true', 'yes'):
+        start = today.replace(month=1, day=1)
+    else:
+        start = _parse_date_arg(request.args.get('from'),
+                                today - timedelta(days=365))
+    end = _parse_date_arg(request.args.get('to'), today)
+    if start > end:
+        return jsonify({'error': 'from must not be after to'}), 400
+
+    conn = _sod_get_conn()
+    try:
+        sod_durability.ensure_tables(conn, USE_POSTGRES)
+        series = sod_durability.daily_series(
+            conn, USE_POSTGRES, list(SOD_TRACKED_SKUS.keys()), start, end)
+        held = sum(1 for d in series['days'] if d['present'])
+        return jsonify({
+            'from': start.isoformat(),
+            'to': end.isoformat(),
+            'days_in_range': len(series['days']),
+            'days_held': held,
+            'days_missing': len(series['days']) - held,
+            'retention_min_days': sod_durability.RETENTION_MIN_DAYS,
+            'skus': {s: SOD_TRACKED_SKUS[s][1] for s in series['skus']
+                     if s in SOD_TRACKED_SKUS},
+            'series': series['days'],
+        })
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _parse_date_arg(raw, default):
+    try:
+        return datetime.strptime((raw or '').strip()[:10], '%Y-%m-%d').date()
+    except Exception:
+        return default
+
+
 @app.route('/api/sod/backfill', methods=['POST'])
 @require_app_origin
 def api_sod_backfill():
@@ -14810,9 +14862,38 @@ def api_admin_sod_rollback_snapshot():
         }), 400
 
     deleted = 0
+    archived = False
     try:
         conn = _sod_get_conn()
         cur = conn.cursor()
+
+        # Nothing is ever deleted without a way back. If this day was ingested
+        # before the archive existed, capture its tracked rows now — once the
+        # weekday file has rolled over, a delete here is irreversible.
+        try:
+            sod_durability.ensure_tables(conn, USE_POSTGRES)
+            ph = '%s' if USE_POSTGRES else '?'
+            cur.execute(f"SELECT COUNT(*) FROM sod_day_archive WHERE snapshot_date={ph}",
+                        (snapshot_date,))
+            if not (cur.fetchone() or [0])[0]:
+                tracked = list(SOD_TRACKED_SKUS.keys())
+                phs = ','.join([ph] * len(tracked))
+                cur.execute(
+                    f"SELECT sku, store_number, snapshot_date, status, on_hand "
+                    f"FROM sod_inventory WHERE snapshot_date={ph} AND sku IN ({phs})",
+                    tuple([snapshot_date] + tracked))
+                rows = [{'sku': r[0], 'store_number': r[1],
+                         'snapshot_date': str(r[2])[:10], 'status': r[3],
+                         'on_hand': r[4]} for r in cur.fetchall()]
+                sod_durability.record_day(
+                    conn, USE_POSTGRES, 'daily_a', snapshot_date,
+                    file_name='(archived at rollback)', tracked_rows_data=rows,
+                    ingest_mode='pre_rollback')
+                archived = True
+        except Exception as _e:
+            return jsonify({'error': f'refusing to delete: could not archive '
+                                     f'the day first ({_e})'}), 500
+
         if USE_POSTGRES:
             cur.execute("DELETE FROM sod_inventory WHERE snapshot_date=%s", (snapshot_date,))
             deleted = cur.rowcount
@@ -14842,6 +14923,7 @@ def api_admin_sod_rollback_snapshot():
         'status': 'ok',
         'snapshot_date': snapshot_date,
         'deleted_rows': deleted,
+        'archived_before_delete': archived,
         'note': 'Snapshot removed from sod_inventory. /new-listings will no longer compare against this date.',
     })
 
