@@ -29341,6 +29341,14 @@ def _geocode_pipeline_daily():
         copied, geo = _geocode_pipeline(conn, limit=10)
         if copied or geo:
             print(f'[SALES] pinned {copied} from licence + {geo} geocoded')
+        # Keep chipping away at real street-address geocoding for the route
+        # optimizer: any store not yet address-precise, plus new stores as they
+        # arrive. A modest hourly batch stays polite to Nominatim and needs no
+        # manual re-trigger. The worker no-ops if a manual backfill is running.
+        try:
+            _geocode_stores_worker(limit=40)
+        except Exception as _gse:
+            print(f'[geo] hourly store geocode skipped: {_gse}')
     except Exception as ex:
         print(f'[SALES] pin-geocode skipped (self-heals next run): {ex}')
     finally:
