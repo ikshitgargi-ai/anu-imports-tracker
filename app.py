@@ -20359,6 +20359,7 @@ def api_geo_backfill():
 
 @app.route('/api/geo/status', methods=['GET'])
 def api_geo_status():
+    _ensure_geo_columns()
     db = get_db()
     row = row_to_dict(db_fetchone(
         "SELECT COUNT(*) AS total, "
@@ -20438,6 +20439,7 @@ def api_route_plan():
     include_horeca = bool(body.get('include_horeca'))
     round_trip = bool(body.get('round_trip', True))
 
+    _ensure_geo_columns()
     db = get_db()
     stores = [row_to_dict(r) for r in db_fetchall(
         "SELECT store_number, account, address, city, postal, lat, lng, "
@@ -26570,6 +26572,10 @@ try:
     _cur.close()
     _conn.close()
     print(f"[startup] Ensured {len(REP_ROSTER_DEFAULT)} official reps in DB: {REP_ROSTER_DEFAULT}")
+    try:
+        _ensure_geo_columns()   # geo_precision must exist before any read uses it
+    except Exception as _ge:
+        print(f'[startup] geo columns: {_ge}')
 
     # Converge stores.rep onto the roster short names the dropdown sends.
     # The seed only normalises rows it INSERTS, and existing rows still carry
