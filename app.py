@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sod_durability
+import route_engine
 import io
 import csv
 import gc
@@ -20273,6 +20274,372 @@ def api_crm_stores_finder():
                     'territory_id': territory_id, 'priority': priority or None},
         'freshness': _sod_freshness(),
     })
+
+
+# ═══════════════════ REAL GEOCODING + DAY ROUTE OPTIMIZER + WALK-IN BRIEF ═══════════════════
+# The route optimizer is only as good as the coordinates under it. On seed,
+# every store was placed at its CITY centroid: 117 Toronto stores share one
+# point. That is fine for a dot on a map and useless for "which stores are on
+# the way". This block geocodes each store's real street address once, plans a
+# minimum-distance day from an origin to a destination city and back, and
+# assembles the pre-visit brief a rep reads before walking in.
+
+def _ensure_geo_columns():
+    """Add geo_precision if missing. 'address' = a real per-address geocode;
+    'city' = a centroid placeholder; '' = never geocoded."""
+    for tbl in ('stores', 'horeca_accounts'):
+        try:
+            conn = _sod_get_conn(); cur = conn.cursor()
+            if USE_POSTGRES:
+                cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS "
+                            f"geo_precision TEXT DEFAULT ''")
+            else:
+                cur.execute(f"PRAGMA table_info({tbl})")
+                if 'geo_precision' not in [r[1] for r in cur.fetchall()]:
+                    cur.execute(f"ALTER TABLE {tbl} ADD COLUMN geo_precision "
+                                f"TEXT DEFAULT ''")
+            conn.commit(); cur.close(); conn.close()
+        except Exception as e:
+            print(f'[geo] ensure column {tbl}: {e}')
+
+
+_geocode_job = {'running': False, 'done': 0, 'total': 0, 'started': None}
+_geocode_lock = threading.Lock()
+
+
+def _geocode_stores_worker(limit=2000):
+    """Geocode real street addresses for stores not yet address-precise.
+
+    Resumable and idempotent: only touches rows whose geo_precision is not
+    'address'. Throttled to Nominatim's 1 request/second by _nominatim_point.
+    A store whose address will not geocode keeps its city centroid, tagged
+    'city', which is still better than 0,0, and is retried next run.
+    """
+    if not _geocode_lock.acquire(blocking=False):
+        return
+    _geocode_job.update(running=True, done=0, started=datetime.utcnow().isoformat())
+    try:
+        conn = _sod_get_conn(); cur = conn.cursor()
+        _ensure_geo_columns()
+        ph = '%s' if USE_POSTGRES else '?'
+        cur.execute(
+            "SELECT store_number, address, city, postal FROM stores "
+            "WHERE COALESCE(geo_precision,'') <> 'address' "
+            "AND COALESCE(address,'') <> '' "
+            "ORDER BY store_number LIMIT " + str(int(limit)))
+        todo = cur.fetchall()
+        _geocode_job['total'] = len(todo)
+        for sn, address, city, postal in todo:
+            q = ', '.join(x for x in (address, postal, city) if x)
+            pt = _nominatim_point(q)
+            if pt:
+                cur.execute(
+                    f"UPDATE stores SET lat={ph}, lng={ph}, geo_precision='address' "
+                    f"WHERE store_number={ph}", (pt[0], pt[1], sn))
+                conn.commit()
+            _geocode_job['done'] += 1
+        cur.close(); conn.close()
+    except Exception as e:
+        print(f'[geo] worker failed: {e}')
+    finally:
+        _geocode_job['running'] = False
+        _geocode_lock.release()
+
+
+@app.route('/api/geo/backfill', methods=['POST'])
+@require_app_origin
+def api_geo_backfill():
+    """Kick off real-address geocoding in the background. Safe to call again;
+    it resumes where it left off and never re-geocodes an address-precise store."""
+    if _geocode_job['running']:
+        return jsonify({'status': 'already_running', **_geocode_job}), 202
+    threading.Thread(target=_geocode_stores_worker, daemon=True).start()
+    return jsonify({'status': 'started'}), 202
+
+
+@app.route('/api/geo/status', methods=['GET'])
+def api_geo_status():
+    db = get_db()
+    row = row_to_dict(db_fetchone(
+        "SELECT COUNT(*) AS total, "
+        "SUM(CASE WHEN geo_precision='address' THEN 1 ELSE 0 END) AS precise, "
+        "SUM(CASE WHEN COALESCE(lat,0)=0 AND COALESCE(lng,0)=0 THEN 1 ELSE 0 END) AS ungeocoded "
+        "FROM stores") or {})
+    return jsonify({'job': _geocode_job, 'coverage': row})
+
+
+def _osrm_matrix(points):
+    """Real driving-distance matrix (km) from the public OSRM server. points is
+    a list of (lat, lng). Returns an n x n list, or None if OSRM is unreachable
+    so the caller falls back to straight-line distance."""
+    if http_requests is None or len(points) < 2 or len(points) > 90:
+        return None
+    coords = ';'.join(f'{lng},{lat}' for lat, lng in points)
+    try:
+        r = http_requests.get(
+            f'https://router.project-osrm.org/table/v1/driving/{coords}',
+            params={'annotations': 'distance'}, timeout=25,
+            headers={'User-Agent': _PROSPECT_UA})
+        r.raise_for_status()
+        dist = r.json().get('distances')
+        if not dist:
+            return None
+        return [[(v / 1000.0 if v is not None else None) for v in row] for row in dist]
+    except Exception as e:
+        print(f'[route] OSRM matrix failed, using straight-line: {e}')
+        return None
+
+
+def _resolve_origin(body):
+    """Origin can be GPS coords, a typed address, or a city name. Returns
+    ((lat, lng), label) or (None, reason)."""
+    try:
+        lat = float(body.get('origin_lat') or 0)
+        lng = float(body.get('origin_lng') or 0)
+    except (TypeError, ValueError):
+        lat = lng = 0
+    if lat and lng:
+        return (lat, lng), 'current location'
+    addr = (body.get('origin_address') or body.get('origin_city') or '').strip()
+    if addr:
+        pt = _nominatim_point(addr)
+        if pt:
+            return pt, addr
+    return None, 'origin not given (need GPS, a home address, or a city)'
+
+
+@app.route('/api/route/plan', methods=['POST'])
+@require_app_origin
+def api_route_plan():
+    """Plan a minimum-distance day: from an origin to a destination city and
+    back, hitting the most worthwhile LCBO stores on the corridor and around
+    the city. Optionally weave in the nearest on-trade accounts.
+
+    Body: origin_lat/origin_lng OR origin_address OR origin_city (one required),
+          dest_city (required), plus optional tunables and include_horeca.
+    """
+    body = request.get_json(silent=True) or {}
+    origin, olabel = _resolve_origin(body)
+    if origin is None:
+        return jsonify({'error': olabel}), 400
+    dest_city = (body.get('dest_city') or '').strip()
+    if not dest_city:
+        return jsonify({'error': 'dest_city is required'}), 400
+    dest = _nominatim_point(dest_city)
+    if dest is None:
+        return jsonify({'error': f'could not locate {dest_city!r}'}), 400
+
+    corridor_km = float(body.get('corridor_km', 20))
+    dest_radius_km = float(body.get('dest_radius_km', 25))
+    max_stops = int(body.get('max_stops', 25))
+    dwell_min = float(body.get('dwell_min', 25))
+    day_hours = float(body.get('day_hours', 8))
+    avg_speed_kmh = float(body.get('avg_speed_kmh', 55))
+    include_horeca = bool(body.get('include_horeca'))
+    round_trip = bool(body.get('round_trip', True))
+
+    db = get_db()
+    stores = [row_to_dict(r) for r in db_fetchall(
+        "SELECT store_number, account, address, city, postal, lat, lng, "
+        "COALESCE(geo_precision,'') AS geo_precision "
+        "FROM stores WHERE COALESCE(lat,0)<>0 AND COALESCE(lng,0)<>0 "
+        "AND store_number > 0")]
+    if not stores:
+        return jsonify({'error': 'no geocoded stores yet; run /api/geo/backfill'}), 400
+
+    # Value signal: which stores carry our SKUs right now, and stock level.
+    latest = row_to_dict(db_fetchone(
+        "SELECT MAX(snapshot_date) AS d FROM sod_inventory") or {}).get('d')
+    listed, low = set(), set()
+    if latest:
+        for r in db_fetchall(
+                "SELECT store_number, on_hand, status FROM sod_inventory "
+                "WHERE snapshot_date=" + ('%s' if USE_POSTGRES else '?') +
+                " AND sku IN (" + ','.join(
+                    ['%s' if USE_POSTGRES else '?'] * len(SOD_TRACKED_SKUS)) + ")",
+                [latest] + list(SOD_TRACKED_SKUS.keys())):
+            rd = row_to_dict(r)
+            sn = int(rd['store_number'])
+            if rd.get('status') == 'L':
+                listed.add(sn)
+                if (rd.get('on_hand') or 0) <= 2:
+                    low.add(sn)
+
+    cand = route_engine.corridor_select(stores, origin, dest, corridor_km, dest_radius_km)
+
+    def score(s):
+        sn = int(s['store_number'])
+        v = 1.0
+        if sn not in listed:
+            v += 2.0            # a store not carrying us is a new-listing prize
+        elif sn in low:
+            v += 1.5            # carrying but nearly empty: protect the listing
+        if s['why'] == 'destination_area':
+            v += 0.5            # the city is the point of the trip
+        v -= 0.05 * s['detour_km']
+        s['gap'] = sn not in listed
+        s['low_stock'] = sn in low
+        s['priority_score'] = round(v, 2)
+        return v
+
+    cand.sort(key=score, reverse=True)
+    # Collapse stores that resolve to the exact same point (leftover city
+    # centroids that were never address-geocoded) so the route does not stack
+    # ten stops on one pixel. Highest-scored wins the spot.
+    seen_pt, deduped = set(), []
+    for sc in cand:
+        key = (round(sc['lat'], 4), round(sc['lng'], 4))
+        if key in seen_pt:
+            continue
+        seen_pt.add(key)
+        deduped.append(sc)
+    cand = deduped[:60]         # keep OSRM table within its limit
+
+    pts = [origin] + [(s['lat'], s['lng']) for s in cand]
+    osrm = _osrm_matrix(pts)
+    if osrm:
+        idx = {id(origin): 0}
+        for i, s in enumerate(cand, start=1):
+            idx[(round(s['lat'], 6), round(s['lng'], 6))] = i
+
+        def dist_fn(a, b):
+            ia = 0 if a is origin else idx.get((round(a[0], 6), round(a[1], 6)))
+            ib = 0 if b is origin else idx.get((round(b[0], 6), round(b[1], 6)))
+            if ia is not None and ib is not None and osrm[ia][ib] is not None:
+                return osrm[ia][ib]
+            return route_engine.haversine_km(a, b)
+        matrix_source = 'osrm_driving'
+    else:
+        _ROAD_FACTOR = 1.3   # real roads are ~30% longer than the straight line
+        dist_fn = lambda a, b: route_engine.haversine_km(a, b) * _ROAD_FACTOR
+        matrix_source = 'straight_line_x1.3'
+
+    plan = route_engine.fit_to_day(
+        cand, origin, dist_fn, max_stops=max_stops, dwell_min=dwell_min,
+        avg_speed_kmh=avg_speed_kmh, day_minutes=day_hours * 60,
+        round_trip=round_trip)
+
+    horeca_stops = []
+    if include_horeca:
+        hor = [row_to_dict(r) for r in db_fetchall(
+            "SELECT id, name, account_type, address, city, lat, lng, status, "
+            "phone, contact_name FROM horeca_accounts "
+            "WHERE COALESCE(lat,0)<>0 AND COALESCE(lng,0)<>0")]
+        for h in hor:
+            d_line = route_engine.point_to_segment_km((h['lat'], h['lng']), origin, dest)
+            d_dest = route_engine.haversine_km((h['lat'], h['lng']), dest)
+            if d_line <= corridor_km or d_dest <= dest_radius_km:
+                h['detour_km'] = round(d_line, 2)
+                horeca_stops.append(h)
+        horeca_stops.sort(key=lambda h: h['detour_km'])
+        horeca_stops = horeca_stops[:int(body.get('max_horeca', 8))]
+
+    fuel = route_engine.fuel_estimate(plan['total_km'])
+    day_min = day_hours * 60
+    day_feasible = plan['total_min'] <= day_min + dwell_min
+    advice = ''
+    if not day_feasible:
+        advice = (f"This does not fit one {day_hours:.0f}-hour day: even the "
+                  f"shortest version is about {plan['total_min']/60:.1f} hours. "
+                  f"{dest_city} is likely an overnight, or plan a one-way trip "
+                  f"(set round_trip off) and route home separately.")
+    elif plan['dropped']:
+        advice = (f"{len(plan['dropped'])} more worthwhile stores are on this "
+                  f"corridor than fit today. Raise day_hours or run a second day.")
+    return jsonify({
+        'day_feasible': day_feasible,
+        'advice': advice,
+        'origin': {'lat': origin[0], 'lng': origin[1], 'label': olabel},
+        'destination': {'lat': dest[0], 'lng': dest[1], 'city': dest_city},
+        'matrix_source': matrix_source,
+        'round_trip': round_trip,
+        'params': {'corridor_km': corridor_km, 'dest_radius_km': dest_radius_km,
+                   'max_stops': max_stops, 'dwell_min': dwell_min,
+                   'day_hours': day_hours, 'avg_speed_kmh': avg_speed_kmh},
+        'stops': plan['stops'],
+        'stop_count': len(plan['stops']),
+        'dropped_for_time': len(plan['dropped']),
+        'candidates_considered': len(cand),
+        'horeca_stops': horeca_stops,
+        'totals': {'drive_km': plan['total_km'], 'drive_min': plan['drive_min'],
+                   'total_min': plan['total_min'],
+                   'total_hours': round(plan['total_min'] / 60.0, 1),
+                   **fuel},
+        'how_to_read': (
+            'Stops are ordered to minimise driving. gap=true means the store '
+            'does not carry our SKUs yet (a new-listing target); low_stock=true '
+            'means it carries us but is nearly empty. dropped_for_time is how '
+            'many worthwhile stores did not fit the day.'),
+    })
+
+
+@app.route('/api/store/<int:store_number>/brief', methods=['GET'])
+def api_store_brief(store_number):
+    """The walk-in brief: everything a rep should have in hand before entering a
+    store. Current stock of each of our SKUs, listing status, last visit and who
+    made it, contacts, and the gap or reorder angle to lead with."""
+    db = get_db()
+    ph = '%s' if USE_POSTGRES else '?'
+    s = row_to_dict(db_fetchone(
+        f"SELECT store_number, account, address, city, postal, phone, "
+        f"manager_name, asst_manager_name, manager_phone, store_email, rep, "
+        f"lat, lng FROM stores WHERE store_number={ph}", [store_number]) or {})
+    if not s:
+        return jsonify({'error': 'store not found'}), 404
+
+    latest = row_to_dict(db_fetchone(
+        "SELECT MAX(snapshot_date) AS d FROM sod_inventory") or {}).get('d')
+    skus = []
+    if latest:
+        by_sku = {}
+        for r in db_fetchall(
+                f"SELECT sku, on_hand, status FROM sod_inventory "
+                f"WHERE store_number={ph} AND snapshot_date={ph}",
+                [store_number, latest]):
+            rd = row_to_dict(r)
+            by_sku[rd['sku']] = rd
+        for code, (brand, name) in SOD_TRACKED_SKUS.items():
+            row = by_sku.get(code) or by_sku.get(code.lstrip('0'))
+            if row:
+                oh = row.get('on_hand') or 0
+                st = row.get('status')
+                state = ('listed' if st == 'L' else 'delisted' if st in ('D', 'F')
+                         else st or 'unknown')
+                skus.append({'sku': code, 'brand': brand, 'product': name,
+                             'on_hand': oh, 'status': state,
+                             'flag': ('OUT' if st == 'L' and oh == 0 else
+                                      'LOW' if st == 'L' and oh <= 2 else
+                                      'OK' if st == 'L' else 'NOT LISTED')})
+            else:
+                skus.append({'sku': code, 'brand': brand, 'product': name,
+                             'on_hand': 0, 'status': 'not_listed', 'flag': 'GAP'})
+
+    last = row_to_dict(db_fetchone(
+        f"SELECT a.created_at, a.activity_type, a.rep, a.outcome, a.notes "
+        f"FROM activities a JOIN stores s ON a.store_id = s.id "
+        f"WHERE s.store_number={ph} "
+        f"ORDER BY a.created_at DESC LIMIT 1", [store_number]) or {})
+
+    listed = [x for x in skus if x['status'] == 'listed']
+    gaps = [x for x in skus if x['flag'] in ('GAP', 'NOT LISTED')]
+    lows = [x for x in skus if x['flag'] in ('LOW', 'OUT')]
+    if lows:
+        angle = ('Reorder: ' + ', '.join(f"{x['brand']} ({x['on_hand']} left)"
+                                          for x in lows))
+    elif gaps:
+        angle = ('Pitch a listing: ' + ', '.join(x['brand'] for x in gaps[:3]))
+    else:
+        angle = 'All listed and stocked. Check facings and push velocity.'
+
+    return jsonify({
+        'store': s,
+        'snapshot_date': latest,
+        'skus': skus,
+        'summary': {'listed': len(listed), 'gaps': len(gaps), 'low_or_out': len(lows)},
+        'last_visit': last or None,
+        'lead_with': angle,
+    })
+
 
 
 @app.route('/api/crm/nearby', methods=['GET'])
