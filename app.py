@@ -20326,7 +20326,10 @@ def _geocode_stores_worker(limit=2000):
             "SELECT store_number, address, city, postal FROM stores "
             "WHERE COALESCE(geo_precision,'') <> 'address' "
             "AND COALESCE(address,'') <> '' "
-            "ORDER BY store_number LIMIT " + str(int(limit)))
+            # never-tried rows (still at 0,0) first, so every run makes fresh
+            # progress instead of re-hammering the un-resolvable addresses.
+            "ORDER BY (CASE WHEN COALESCE(lat,0)=0 THEN 0 ELSE 1 END), "
+            "store_number LIMIT " + str(int(limit)))
         todo = cur.fetchall()
         _geocode_job['total'] = len(todo)
         for sn, address, city, postal in todo:
@@ -20337,6 +20340,18 @@ def _geocode_stores_worker(limit=2000):
                     f"UPDATE stores SET lat={ph}, lng={ph}, geo_precision='address' "
                     f"WHERE store_number={ph}", (pt[0], pt[1], sn))
                 conn.commit()
+            elif city:
+                # The street address would not resolve. Fall back to the city
+                # centre so the store is at least routable and visible on the
+                # map, tagged 'city' so a later run still tries for the precise
+                # point. Better a rough pin than an invisible store.
+                cpt = CITY_COORDS.get(city) or _nominatim_point(city)
+                if cpt:
+                    cur.execute(
+                        f"UPDATE stores SET lat={ph}, lng={ph}, geo_precision='city' "
+                        f"WHERE store_number={ph} AND COALESCE(lat,0)=0",
+                        (cpt[0], cpt[1], sn))
+                    conn.commit()
             _geocode_job['done'] += 1
         cur.close(); conn.close()
     except Exception as e:
