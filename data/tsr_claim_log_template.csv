@@ -1,0 +1,3 @@
+purchase_date,stream,product,cspc,store_number,bottles,unit_retail,extended_cost,receipt_number,receipt_stamped,receipt_scan_ref,poured_at,poured_date,rep,claim_month,submitted_on,refund_expected,refund_received,notes
+2026-08-04,GP,Example Pinot Grigio 750ml,123456,217,2,19.95,39.90,R-2026-0801,Y,scans/2026-08/R-2026-0801.jpg,LCBO 217 staff tasting,2026-08-04,,2026-08,,12.57,,
+2026-08-11,VINTAGES,Example Release Cabernet 750ml,654321,10,1,32.00,32.00,R-2026-0811,Y,scans/2026-08/R-2026-0811.jpg,Licensee buyer meeting,2026-08-12,,2026-08,,10.08,,PO was 900 bottles - 2% test applies
