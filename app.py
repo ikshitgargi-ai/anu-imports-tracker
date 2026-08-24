@@ -311,7 +311,7 @@ def require_admin_token(fn):
 # separate places per app and they had drifted apart: /api/reps was missing
 # Surya, and NB was missing Vaneet and Ed entirely. Everything below derives
 # from this list so they cannot disagree again.
-ANU_REP_ROSTER = ['Ikshit', 'Namit', 'Surya', 'Vaneet', 'Ed']
+ANU_REP_ROSTER = ['Ikshit', 'Namit', 'Surya', 'Vaneet', 'Kush']
 _REP_MATCH_NAMES = list(ANU_REP_ROSTER)
 
 
@@ -1895,7 +1895,13 @@ def api_store_snapshot(store_id):
 
 @app.route('/api/reps')
 def api_reps():
-    rows = db_fetchall("SELECT * FROM reps ORDER BY name")
+    # Active roster only. Names no longer on the roster (e.g. Ed) and stale
+    # directory rows stay in the DB because nothing is ever deleted, but they
+    # are filtered out of every picker so a rep can only log as a current rep.
+    ph_list = ','.join(['%s' if USE_POSTGRES else '?'] * len(ANU_REP_ROSTER))
+    rows = db_fetchall(
+        f"SELECT * FROM reps WHERE TRIM(name) IN ({ph_list}) ORDER BY name",
+        list(ANU_REP_ROSTER))
     return jsonify([dict(r) for r in rows])
 
 
@@ -20267,9 +20273,35 @@ def api_crm_stores_finder():
             'total_deals': int(r[23] or 0),
             'open_deals': int(r[24] or 0),
         })
+    # Attach OUR products' shelf position per store so a lookup shows stock, not
+    # just whether we are listed. One grouped query at the latest snapshot, not
+    # 766 subqueries. our_on_hand = units of our listed SKUs on the shelf;
+    # our_skus_listed = how many of our SKUs are listed; carries_us = any.
+    latest = (row_to_dict(db_fetchone(
+        "SELECT MAX(snapshot_date) AS d FROM sod_inventory") or {}) or {}).get('d')
+    stock_by_store = {}
+    if latest:
+        phs = ','.join([ph] * len(SOD_TRACKED_SKUS))
+        for r in db_fetchall(
+                f"SELECT store_number, "
+                f"SUM(CASE WHEN status='L' THEN 1 ELSE 0 END) AS listed, "
+                f"SUM(CASE WHEN status='L' THEN COALESCE(on_hand,0) ELSE 0 END) AS oh "
+                f"FROM sod_inventory WHERE snapshot_date={ph} AND sku IN ({phs}) "
+                f"GROUP BY store_number",
+                [latest] + list(SOD_TRACKED_SKUS.keys())):
+            rd = row_to_dict(r)
+            stock_by_store[int(rd['store_number'])] = (
+                int(rd.get('listed') or 0), int(rd.get('oh') or 0))
+    for st in stores:
+        listed, oh = stock_by_store.get(int(st['store_number']), (0, 0))
+        st['our_skus_listed'] = listed
+        st['our_on_hand'] = oh
+        st['carries_us'] = listed > 0
     return jsonify({
         'count': len(stores),
         'stores': stores,
+        'our_skus_total': len(SOD_TRACKED_SKUS),
+        'snapshot_date': latest,
         'filters': {'city': city or None, 'rep': rep or None,
                     'territory_id': territory_id, 'priority': priority or None},
         'freshness': _sod_freshness(),
