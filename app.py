@@ -5039,6 +5039,93 @@ def start_sod_sync_async(sources=None):
 
 # --------- Endpoints ---------
 
+_RAW_PROBE_LOCK = threading.Lock()
+
+
+@app.route('/api/sod/raw-probe', methods=['GET'])
+def api_sod_raw_probe():
+    """Diagnostic, read-only: download the freshest daily SOD file and report
+    what is actually in it, line by line, so a feed change can be seen rather
+    than guessed. Nothing is written. One run at a time.
+
+    Query: store=27&store=33 (repeatable), sku=0047587 (repeatable),
+           source=daily_a|daily_b, max_lines=40
+    Returns: file name, snapshot date, total lines, parse failures, distinct
+    stores and SKUs, rows per status code, line-length histogram, the first
+    lines verbatim, every raw line for the requested SKUs (capped), and per
+    requested store: how many rows the file holds and a few raw lines.
+    """
+    stores = set()
+    for v in request.args.getlist('store'):
+        try:
+            stores.add(int(v))
+        except ValueError:
+            pass
+    skus = {_pad_sku(v) if '_pad_sku' in globals() else v.zfill(7) for v in request.args.getlist('sku') if v.strip()}
+    source = request.args.get('source', 'daily_a')
+    max_lines = min(int(request.args.get('max_lines', 40) or 40), 200)
+    if not _RAW_PROBE_LOCK.acquire(blocking=False):
+        return jsonify({'error': 'a probe is already running; try again in a minute'}), 429
+    try:
+        client = SODClient()
+        zip_bytes, fn, snap = client.download_option(source)
+        out = {'file_name': fn, 'snapshot_date_peeked': snap, 'zip_bytes': len(zip_bytes),
+               'total_lines': 0, 'parsed_rows': 0, 'parse_failures': 0,
+               'first_lines': [], 'line_length_hist': {}, 'rows_by_date': {},
+               'rows_by_status': {}, 'distinct_stores': 0, 'distinct_skus': 0,
+               'store_min': None, 'store_max': None,
+               'requested_skus': {k: {'rows': 0, 'stores': [], 'raw_lines': []} for k in sorted(skus)},
+               'requested_stores': {str(k): {'rows': 0, 'skus_sample': [], 'raw_lines': []} for k in sorted(stores)},
+               'failed_line_samples': []}
+        seen_stores, seen_skus = set(), set()
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            name = zf.namelist()[0]
+            out['member'] = name
+            with zf.open(name) as raw_stream:
+                text = io.TextIOWrapper(raw_stream, encoding='latin-1', errors='replace', newline='')
+                for line in text:
+                    line = line.rstrip('\r\n')
+                    out['total_lines'] += 1
+                    L = len(line)
+                    out['line_length_hist'][L] = out['line_length_hist'].get(L, 0) + 1
+                    if len(out['first_lines']) < 5:
+                        out['first_lines'].append(line)
+                    row = _parse_sod_line(line)
+                    if row is None:
+                        out['parse_failures'] += 1
+                        if len(out['failed_line_samples']) < 10:
+                            out['failed_line_samples'].append(line[:120])
+                        continue
+                    out['parsed_rows'] += 1
+                    d = row['snapshot_date']; out['rows_by_date'][d] = out['rows_by_date'].get(d, 0) + 1
+                    st = row['status']; out['rows_by_status'][st] = out['rows_by_status'].get(st, 0) + 1
+                    sn = row['store_number']; seen_stores.add(sn); seen_skus.add(row['sku'])
+                    if row['sku'] in skus:
+                        k = out['requested_skus'][row['sku']]
+                        k['rows'] += 1; k['stores'].append(sn)
+                        if len(k['raw_lines']) < max_lines:
+                            k['raw_lines'].append(line)
+                    if sn in stores:
+                        k = out['requested_stores'][str(sn)]
+                        k['rows'] += 1
+                        if len(k['skus_sample']) < 8:
+                            k['skus_sample'].append(row['sku'])
+                        if len(k['raw_lines']) < 5:
+                            k['raw_lines'].append(line)
+        out['distinct_stores'] = len(seen_stores); out['distinct_skus'] = len(seen_skus)
+        if seen_stores:
+            out['store_min'] = min(seen_stores); out['store_max'] = max(seen_stores)
+            out['store_numbers_sorted'] = sorted(seen_stores)
+        for k in out['requested_skus'].values():
+            k['stores'] = sorted(k['stores'])
+        out['line_length_hist'] = dict(sorted(out['line_length_hist'].items()))
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({'error': f'{type(e).__name__}: {str(e)[:300]}'}), 500
+    finally:
+        _RAW_PROBE_LOCK.release()
+
+
 @app.route('/api/sod/status', methods=['GET'])
 def api_sod_status():
     """Last sync runs + counts of ingested data + configuration check + freshness."""
