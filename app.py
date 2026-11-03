@@ -5280,7 +5280,10 @@ def api_sod_raw_probe():
     than guessed. Nothing is written. One run at a time.
 
     Query: store=27&store=33 (repeatable), sku=0047587 (repeatable),
-           source=daily_a|daily_b, max_lines=40
+           source=daily_a|daily_b, max_lines=40 (up to 5000 per SKU),
+           day=MON..SUN (optional: read that weekday's file from the rolling
+           7-day window instead of the freshest one; the reply's
+           snapshot_date_peeked and rows_by_date say which dates it holds)
     Returns: file name, snapshot date, total lines, parse failures, distinct
     stores and SKUs, rows per status code, line-length histogram, the first
     lines verbatim, every raw line for the requested SKUs (capped), and per
@@ -5294,12 +5297,16 @@ def api_sod_raw_probe():
             pass
     skus = {_pad_sku(v) if '_pad_sku' in globals() else v.zfill(7) for v in request.args.getlist('sku') if v.strip()}
     source = request.args.get('source', 'daily_a')
-    max_lines = min(int(request.args.get('max_lines', 40) or 40), 200)
+    max_lines = min(int(request.args.get('max_lines', 40) or 40), 5000)
+    day = (request.args.get('day') or '').strip().upper()
+    if day and day not in ('MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'):
+        return jsonify({'error': 'day must be one of MON TUE WED THU FRI SAT SUN'}), 400
     if not _RAW_PROBE_LOCK.acquire(blocking=False):
         return jsonify({'error': 'a probe is already running; try again in a minute'}), 429
     try:
         client = SODClient()
-        zip_bytes, fn, snap = client.download_option(source)
+        named = client._filename_for_weekday(source, day) if day else None
+        zip_bytes, fn, snap = client.download_option(source, filename=named)
         out = {'file_name': fn, 'snapshot_date_peeked': snap, 'zip_bytes': len(zip_bytes),
                'total_lines': 0, 'parsed_rows': 0, 'parse_failures': 0,
                'first_lines': [], 'line_length_hist': {}, 'rows_by_date': {},
